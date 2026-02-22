@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Last Deep Research · Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0b0b0f; --surface: #16161c; --border: #27272f;
+      --text: #e8e8ed; --text-muted: #6b6b7a; --accent-light: #818cf8;
+      --radius: 8px; --mono: 'JetBrains Mono', monospace; --sans: 'Inter', sans-serif;
+    }
+    body { font-family: var(--sans); background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.6; min-height: 100vh; }
+    a { color: var(--accent-light); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .header {
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--border);
+    }
+    .header h1 { font-size: 15px; font-weight: 600; }
+    .header nav { display: flex; gap: 12px; margin-left: 12px; font-size: 13px; }
+    .main { padding: 24px; max-width: 900px; margin: 0 auto; }
+    .meta { font-size: 12px; color: var(--text-muted); margin-bottom: 16px; }
+    .content {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 20px; white-space: pre-wrap; font-size: 13px; line-height: 1.7;
+    }
+    .empty { color: var(--text-muted); font-style: italic; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <h1>Last Deep Research</h1>
+    <nav>
+      <a href="/admin/traces">Traces</a>
+      <a href="/admin/agents">Agents</a>
+      <a href="/api/last-deep-research">JSON</a>
+    </nav>
+  </header>
+  <main class="main">
+    <div class="meta">
+      {% if topic %}Topic: {{ topic }}{% endif %}
+      {% if at %} · {{ at }}{% endif %}
+    </div>
+    <div class="content">
+      {% if content %}
+        {{ content }}
+      {% else %}
+        <span class="empty">No deep research run yet in this session.</span>
+      {% endif %}
+    </div>
+  </main>
+</body>
+</html>

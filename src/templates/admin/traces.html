@@ -1,0 +1,1310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Observability · Traces</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    /* ================================================================
+       CSS RESET + VARIABLES
+       ================================================================ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:             #0b0b0f;
+      --bg-raised:      #111116;
+      --surface:        #16161c;
+      --surface-hover:  #1c1c24;
+      --surface-active: #22222c;
+      --border:         #27272f;
+      --border-light:   #32323c;
+      --text:           #e8e8ed;
+      --text-secondary: #a0a0ad;
+      --text-muted:     #6b6b7a;
+      --accent:         #6366f1;    /* indigo */
+      --accent-light:   #818cf8;
+      --blue:           #3b82f6;
+      --green:          #10b981;
+      --green-bg:       #10b98118;
+      --amber:          #f59e0b;
+      --amber-bg:       #f59e0b18;
+      --red:            #ef4444;
+      --red-bg:         #ef444418;
+      --purple:         #a855f7;
+      --purple-bg:      #a855f718;
+      --cyan:           #06b6d4;
+      --cyan-bg:        #06b6d418;
+      --radius:         8px;
+      --radius-sm:      5px;
+      --radius-lg:      12px;
+      --shadow:         0 1px 3px rgba(0,0,0,.4);
+      --shadow-lg:      0 4px 12px rgba(0,0,0,.5);
+      --mono:           'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      --sans:           'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    body {
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.5;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent-light); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ================================================================
+       LAYOUT
+       ================================================================ */
+    .layout { display: flex; flex-direction: column; min-height: 100vh; }
+
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; z-index: 100;
+    }
+    .header-left { display: flex; align-items: center; gap: 12px; }
+    .header h1 {
+      font-size: 15px; font-weight: 600; color: var(--text);
+      display: flex; align-items: center; gap: 8px;
+    }
+    .header h1 .icon { font-size: 18px; opacity: .7; }
+    .header .subtitle { color: var(--text-muted); font-size: 12px; font-weight: 400; }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+    .stat-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 20px;
+      background: var(--surface-hover); border: 1px solid var(--border);
+      font-size: 11px; color: var(--text-secondary); font-weight: 500;
+    }
+    .stat-pill .val { color: var(--text); font-family: var(--mono); font-size: 11px; }
+
+    .main { flex: 1; padding: 20px 24px; }
+
+    /* ================================================================
+       TRACE TABLE
+       ================================================================ */
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th {
+      text-align: left; padding: 10px 14px;
+      font-weight: 600; font-size: 10px;
+      text-transform: uppercase; letter-spacing: .6px;
+      color: var(--text-muted);
+      background: var(--bg-raised);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      position: sticky; top: 50px; z-index: 10;
+    }
+    td { padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    tbody tr.trace-row { cursor: pointer; transition: background .1s; }
+    tbody tr.trace-row:hover td { background: var(--surface-hover); }
+    tbody tr.trace-row.expanded td { background: var(--surface-active); }
+
+    .col-expand { width: 28px; text-align: center; }
+    .col-time   { width: 130px; }
+    .col-ch     { width: 80px; }
+    .col-msg    { min-width: 180px; }
+    .col-steps  { width: 60px; text-align: center; }
+    .col-cost   { width: 80px; text-align: right; }
+    .col-tok    { width: 90px; text-align: right; }
+    .col-dur    { width: 80px; text-align: right; }
+
+    .time-text  { color: var(--text-muted); font-family: var(--mono); font-size: 11px; }
+    .msg-text   { max-width: 350px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dur-text   { color: var(--text-muted); font-family: var(--mono); font-size: 11px; }
+    .cost-text  { color: var(--green); font-family: var(--mono); font-size: 11px; font-weight: 500; }
+    .tok-text   { color: var(--text-muted); font-family: var(--mono); font-size: 11px; }
+
+    .chevron {
+      display: inline-block; font-size: 11px; color: var(--text-muted);
+      transition: transform .15s ease;
+    }
+    tr.expanded .chevron { transform: rotate(90deg); }
+
+    .channel-badge {
+      display: inline-block; padding: 2px 7px; border-radius: 4px;
+      font-size: 10px; font-weight: 500;
+      background: var(--surface-hover); color: var(--text-secondary);
+      border: 1px solid var(--border);
+    }
+    .channel-badge.web { border-color: var(--blue); color: var(--blue); }
+    .channel-badge.whatsapp { border-color: var(--green); color: var(--green); }
+    .channel-badge.api { border-color: var(--purple); color: var(--purple); }
+
+    .steps-count {
+      display: inline-flex; align-items: center; justify-content: center;
+      min-width: 22px; height: 20px; padding: 0 6px;
+      border-radius: 10px; background: var(--surface-hover);
+      font-size: 11px; font-weight: 600; color: var(--text-secondary);
+    }
+
+    /* ================================================================
+       DETAIL ROW
+       ================================================================ */
+    .detail-row td {
+      padding: 0 !important;
+      background: var(--bg) !important;
+      border-bottom: 2px solid var(--border) !important;
+    }
+    .detail-wrap {
+      padding: 20px 24px 24px;
+      animation: slideDown .2s ease-out;
+    }
+    @keyframes slideDown {
+      from { opacity: 0; transform: translateY(-8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* --- Narrator --- */
+    .narrator-card {
+      padding: 14px 16px;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16162a 100%);
+      border: 1px solid #2a2a40;
+      border-left: 3px solid var(--accent);
+      border-radius: var(--radius);
+      margin-bottom: 16px;
+    }
+    .narrator-label {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .6px; color: var(--accent-light); margin-bottom: 6px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .narrator-text {
+      font-size: 13px; line-height: 1.6; color: var(--text);
+    }
+
+    /* --- Summary cards --- */
+    .summary-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .summary-card {
+      padding: 12px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    .summary-card .sc-label {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .5px; color: var(--text-muted); margin-bottom: 4px;
+    }
+    .summary-card .sc-value {
+      font-size: 18px; font-weight: 700; font-family: var(--mono);
+      color: var(--text);
+    }
+    .summary-card .sc-sub {
+      font-size: 10px; color: var(--text-muted); margin-top: 2px;
+      font-family: var(--mono);
+    }
+    .summary-card.cost .sc-value { color: var(--green); }
+    .summary-card.tokens .sc-value { color: var(--cyan); font-size: 16px; }
+    .summary-card.duration .sc-value { color: var(--amber); }
+
+    /* --- Messages --- */
+    .messages-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+      margin-bottom: 16px;
+    }
+    .msg-card {
+      padding: 12px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    .msg-card .mc-label {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .5px; color: var(--text-muted); margin-bottom: 6px;
+      display: flex; align-items: center; gap: 5px;
+    }
+    .msg-card .mc-text {
+      font-size: 12px; line-height: 1.5; color: var(--text-secondary);
+      max-height: 100px; overflow-y: auto; word-break: break-word;
+    }
+
+    /* --- Waterfall timeline --- */
+    .waterfall-section { margin-bottom: 16px; }
+    .section-label {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .6px; color: var(--text-muted); margin-bottom: 8px;
+    }
+    .waterfall-bar {
+      display: flex; height: 28px; border-radius: 6px;
+      overflow: hidden; background: var(--surface);
+      border: 1px solid var(--border);
+    }
+    .wf-seg {
+      min-width: 6px; position: relative; transition: filter .15s;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      font-size: 9px; font-weight: 600; color: rgba(255,255,255,.7);
+      overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+      padding: 0 4px;
+    }
+    .wf-seg:hover { filter: brightness(1.3); z-index: 1; }
+    .wf-seg.agent_call { background: var(--blue); }
+    .wf-seg.tool_result { background: var(--green); }
+    .wf-seg.sub_agent  { background: var(--amber); }
+    .waterfall-legend {
+      display: flex; gap: 16px; margin-top: 6px; font-size: 10px; color: var(--text-muted);
+    }
+    .waterfall-legend .leg-item { display: flex; align-items: center; gap: 4px; }
+    .waterfall-legend .leg-dot {
+      width: 8px; height: 8px; border-radius: 2px;
+    }
+    .leg-dot.agent_call { background: var(--blue); }
+    .leg-dot.tool_result { background: var(--green); }
+    .leg-dot.sub_agent  { background: var(--amber); }
+
+    /* ================================================================
+       STEP CARDS
+       ================================================================ */
+    .steps-section { margin-top: 4px; }
+    .step {
+      margin-bottom: 6px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      transition: border-color .15s;
+    }
+    .step:hover { border-color: var(--border-light); }
+    .step.agent_call { border-left: 3px solid var(--blue); }
+    .step.tool_result { border-left: 3px solid var(--green); }
+    .step.sub_agent  { border-left: 3px solid var(--amber); }
+
+    .step-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 14px;
+      background: var(--surface);
+      cursor: pointer; user-select: none;
+      transition: background .1s;
+    }
+    .step-header:hover { background: var(--surface-hover); }
+    .step-header-left { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+    .step-header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+    .step-num {
+      width: 22px; height: 22px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 10px; font-weight: 700; flex-shrink: 0;
+      background: var(--surface-hover); color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+    .step.agent_call .step-num { background: #3b82f620; color: var(--blue); border-color: #3b82f640; }
+    .step.tool_result .step-num { background: #10b98120; color: var(--green); border-color: #10b98140; }
+    .step.sub_agent .step-num { background: #f59e0b20; color: var(--amber); border-color: #f59e0b40; }
+
+    .step-type-badge {
+      padding: 2px 7px; border-radius: 4px;
+      font-size: 9px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .4px; flex-shrink: 0;
+    }
+    .step.agent_call .step-type-badge { background: #3b82f620; color: var(--blue); }
+    .step.tool_result .step-type-badge { background: #10b98120; color: var(--green); }
+    .step.sub_agent .step-type-badge { background: #f59e0b20; color: var(--amber); }
+
+    .step-name {
+      font-weight: 600; font-size: 12px; color: var(--text);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .step-desc {
+      font-size: 11px; color: var(--text-muted); margin-top: 2px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 450px;
+    }
+
+    .step-model-badge {
+      padding: 2px 7px; border-radius: 4px;
+      font-size: 10px; font-family: var(--mono); font-weight: 500;
+      background: var(--purple-bg); color: var(--purple);
+      border: 1px solid #a855f730;
+    }
+    .step-cost-badge {
+      padding: 2px 7px; border-radius: 4px;
+      font-size: 10px; font-family: var(--mono); font-weight: 600;
+      background: var(--green-bg); color: var(--green);
+    }
+    .step-tokens-badge {
+      padding: 2px 7px; border-radius: 4px;
+      font-size: 10px; font-family: var(--mono);
+      background: var(--cyan-bg); color: var(--cyan);
+    }
+    .step-dur-badge {
+      padding: 2px 7px; border-radius: 4px;
+      font-size: 10px; font-family: var(--mono);
+      background: var(--surface-hover); color: var(--text-muted);
+      min-width: 50px; text-align: right;
+    }
+    .step-status-badge {
+      width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+    }
+    .step-status-badge.ok { background: var(--green); }
+    .step-status-badge.fail { background: var(--red); }
+
+    .step-expand-icon {
+      font-size: 10px; color: var(--text-muted);
+      transition: transform .15s;
+      flex-shrink: 0;
+    }
+    .step.open .step-expand-icon { transform: rotate(90deg); }
+
+    .step-body {
+      display: none;
+      padding: 12px 14px;
+      background: var(--bg-raised);
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+    }
+    .step.open .step-body { display: block; }
+
+    .step-body-grid {
+      display: grid; grid-template-columns: auto 1fr;
+      gap: 4px 12px; align-items: start;
+    }
+    .sb-key {
+      font-weight: 600; color: var(--text-muted); font-size: 10px;
+      text-transform: uppercase; letter-spacing: .3px;
+      padding-top: 2px;
+    }
+    .sb-val {
+      color: var(--text-secondary); font-size: 11px;
+      word-break: break-word; line-height: 1.5;
+    }
+    .sb-val.mono { font-family: var(--mono); font-size: 10px; }
+    .sb-val a { color: var(--accent-light); }
+
+    /* Token bar visualization */
+    .token-bar-wrap { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+    .token-bar {
+      display: flex; height: 6px; border-radius: 3px; overflow: hidden;
+      flex: 1; max-width: 200px; background: var(--surface);
+    }
+    .token-bar .tb-in { background: var(--blue); }
+    .token-bar .tb-out { background: var(--purple); }
+    .token-bar-label { font-size: 10px; color: var(--text-muted); font-family: var(--mono); }
+
+    /* Raw JSON toggle */
+    .raw-toggle {
+      margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+    }
+    .raw-toggle summary {
+      cursor: pointer; font-size: 10px; color: var(--text-muted);
+      font-weight: 500; user-select: none;
+    }
+    .raw-toggle summary:hover { color: var(--text-secondary); }
+    .raw-json {
+      font-family: var(--mono); font-size: 10px; line-height: 1.5;
+      padding: 10px; margin-top: 6px;
+      background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      white-space: pre-wrap; word-break: break-word;
+      max-height: 300px; overflow-y: auto; color: var(--text-muted);
+    }
+
+    /* ================================================================
+       VISUALIZATION TABS + PANELS
+       ================================================================ */
+    .viz-tabs {
+      display: inline-flex;
+      gap: 2px;
+      margin-bottom: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 2px;
+    }
+    .viz-tab {
+      padding: 6px 14px;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      color: var(--text-muted);
+      cursor: pointer;
+      border-radius: 4px;
+      border: none;
+      background: transparent;
+      transition: all .15s;
+      font-family: var(--sans);
+    }
+    .viz-tab:hover { color: var(--text-secondary); background: var(--surface-hover); }
+    .viz-tab.active { color: var(--text); background: var(--accent); }
+    .viz-panel { display: none; }
+    .viz-panel.active { display: block; }
+
+    /* Mermaid */
+    .mermaid-diagram {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 16px;
+      overflow-x: auto;
+      min-height: 80px;
+    }
+    .mermaid-diagram svg { max-width: 100%; height: auto !important; }
+    .mermaid-loading {
+      color: var(--text-muted); font-size: 11px; text-align: center; padding: 20px;
+    }
+
+    /* ECharts Gantt */
+    .gantt-chart {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    /* ================================================================
+       EMPTY STATE
+       ================================================================ */
+    .empty-state {
+      text-align: center; padding: 60px 24px; color: var(--text-muted);
+    }
+    .empty-state .icon { font-size: 32px; opacity: .5; margin-bottom: 12px; }
+    .empty-state .title { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }
+    .empty-state .desc { font-size: 12px; }
+
+    /* ================================================================
+       UTILITIES
+       ================================================================ */
+    .hidden { display: none !important; }
+    .mono { font-family: var(--mono); }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
+
+    @media (max-width: 768px) {
+      .messages-grid { grid-template-columns: 1fr; }
+      .summary-row { grid-template-columns: repeat(2, 1fr); }
+      .main { padding: 12px; }
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'dark',
+      themeVariables: {
+        primaryColor: '#3b82f6',
+        primaryTextColor: '#e8e8ed',
+        primaryBorderColor: '#3b82f640',
+        lineColor: '#6b6b7a',
+        secondaryColor: '#10b981',
+        tertiaryColor: '#f59e0b',
+        background: '#16161c',
+        mainBkg: '#1c1c24',
+        noteBkgColor: '#22222c',
+        noteTextColor: '#a0a0ad',
+        noteBorderColor: '#32323c',
+        actorBkg: '#16161c',
+        actorBorder: '#3b82f640',
+        actorTextColor: '#e8e8ed',
+        signalColor: '#a0a0ad',
+        signalTextColor: '#e8e8ed',
+      },
+      sequence: {
+        actorMargin: 50,
+        mirrorActors: false,
+        bottomMarginAdj: 10,
+        messageFontSize: 11,
+        noteFontSize: 10,
+        actorFontSize: 11,
+        noteMargin: 8,
+        messageMargin: 30,
+        width: 180,
+      },
+      fontFamily: 'Inter, -apple-system, sans-serif',
+    });
+  </script>
+</head>
+<body>
+  <div class="layout">
+    <!-- ============================================================
+         HEADER
+         ============================================================ -->
+    <header class="header">
+      <div class="header-left">
+        <h1><span class="icon">&#9783;</span> Admin</h1>
+        <span class="subtitle">Trace Explorer</span>
+        <nav style="display: flex; gap: 12px; margin-left: 12px;">
+          <a href="/admin/traces" style="color: var(--accent-light); font-weight: 500;">Traces</a>
+          <a href="/admin/agents" style="color: var(--text-secondary); font-size: 13px;">Agents</a>
+          <a href="/admin/last-deep-research" style="color: var(--text-secondary); font-size: 13px;">Last Research</a>
+        </nav>
+      </div>
+      <div class="header-right">
+        <span class="stat-pill">
+          Traces <span class="val">{{ traces|length }}</span>
+        </span>
+        {% set ns = namespace(total_cost=0.0) %}
+        {% for t in traces %}
+          {% if t.summary and t.summary.total_cost_usd %}
+            {% set ns.total_cost = ns.total_cost + t.summary.total_cost_usd %}
+          {% endif %}
+        {% endfor %}
+        <span class="stat-pill">
+          Total Cost <span class="val">${{ "%.4f"|format(ns.total_cost) }}</span>
+        </span>
+      </div>
+    </header>
+
+    <!-- ============================================================
+         MAIN TABLE
+         ============================================================ -->
+    <main class="main">
+      <div class="table-wrap">
+        {% if traces %}
+        <table>
+          <thead>
+            <tr>
+              <th class="col-expand"></th>
+              <th class="col-time">Time</th>
+              <th class="col-ch">Channel</th>
+              <th class="col-msg">Message</th>
+              <th class="col-steps">Steps</th>
+              <th class="col-cost">Cost</th>
+              <th class="col-tok">Tokens</th>
+              <th class="col-dur">Duration</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for t in traces %}
+            {% set s = t.summary or {} %}
+            <tr class="trace-row" data-trace-id="{{ t.trace_id }}" onclick="toggleTrace('{{ t.trace_id }}')">
+              <td class="col-expand"><span class="chevron">&#x203A;</span></td>
+              <td class="col-time">
+                <span class="time-text">{{ (t.created_at|string)[:19].replace('T',' ') if t.created_at else "-" }}</span>
+              </td>
+              <td class="col-ch">
+                <span class="channel-badge {{ t.channel or '' }}">{{ t.channel or "?" }}</span>
+              </td>
+              <td class="col-msg">
+                <span class="msg-text" title="{{ t.user_message or '' }}">{{ (t.user_message or "-")[:80] }}{% if (t.user_message or "")|length > 80 %}&hellip;{% endif %}</span>
+              </td>
+              <td class="col-steps">
+                <span class="steps-count">{{ s.get('steps', '-') }}</span>
+              </td>
+              <td class="col-cost">
+                <span class="cost-text">${{ "%.4f"|format(s.get('total_cost_usd', 0)) }}</span>
+              </td>
+              <td class="col-tok">
+                <span class="tok-text">{{ "{:,}".format(s.get('total_tokens', 0)) }}</span>
+              </td>
+              <td class="col-dur">
+                <span class="dur-text">{{ "%.0f"|format(s.get('duration_ms', 0)) }}ms</span>
+              </td>
+            </tr>
+            <tr class="detail-row hidden" id="detail-{{ t.trace_id }}" onclick="event.stopPropagation()">
+              <td colspan="8">
+                <div class="detail-wrap">
+                  <div class="section-label">Loading trace&hellip;</div>
+                </div>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+          <div class="icon">&#9783;</div>
+          <div class="title">No traces yet</div>
+          <div class="desc">Send a chat message to generate traces.</div>
+        </div>
+        {% endif %}
+      </div>
+    </main>
+  </div>
+
+  <!-- ==============================================================
+       JAVASCRIPT
+       ============================================================== -->
+  <script>
+    // ── Model pricing (mirrors observability.py) ──────────────────
+    const MODEL_PRICING = {
+      'claude-sonnet-4-5': [3.00, 15.00],
+      'claude-4-5-sonnet': [3.00, 15.00],
+      'claude-sonnet-4-20250514': [3.00, 15.00],
+      'claude-3-5-sonnet-20241022': [3.00, 15.00],
+      'claude-3-5-haiku-20241022': [0.80, 4.00],
+      'claude-3-haiku-20240307': [0.25, 1.25],
+      'gpt-4o': [2.50, 10.00],
+      'gpt-4o-mini': [0.15, 0.60],
+      'o3-mini': [1.10, 4.40],
+      'o3': [10.00, 40.00],
+      'gemini-3-pro-image-preview': [0.25, 1.00],
+      'gemini-2.5-flash-image': [0.15, 0.60],
+      'gemini-2.0-flash': [0.10, 0.40],
+      'gemini-1.5-flash': [0.075, 0.30],
+    };
+
+    function calcCost(model, inTok, outTok) {
+      const p = MODEL_PRICING[model];
+      if (!p) return 0;
+      return (inTok * p[0] / 1e6) + (outTok * p[1] / 1e6);
+    }
+
+    function fmtCost(usd) {
+      if (usd <= 0) return '-';
+      if (usd < 0.001) return '$' + usd.toFixed(6);
+      if (usd < 0.01) return '$' + usd.toFixed(4);
+      return '$' + usd.toFixed(4);
+    }
+
+    function fmtTokens(n) { return n > 0 ? n.toLocaleString() : '-'; }
+    function fmtMs(ms) { return ms > 0 ? (ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : Math.round(ms) + 'ms') : '-'; }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    // ── Trace expand/collapse ─────────────────────────────────────
+    const loaded = {};
+
+    function toggleTrace(traceId) {
+      const row = document.querySelector('.trace-row[data-trace-id="' + traceId + '"]');
+      const detail = document.getElementById('detail-' + traceId);
+      const isOpen = !detail.classList.contains('hidden');
+
+      // Close all
+      document.querySelectorAll('.detail-row').forEach(r => r.classList.add('hidden'));
+      document.querySelectorAll('.trace-row').forEach(r => r.classList.remove('expanded'));
+
+      if (!isOpen) {
+        detail.classList.remove('hidden');
+        row.classList.add('expanded');
+        if (!loaded[traceId]) {
+          fetch('/api/traces/' + traceId)
+            .then(r => r.json())
+            .then(t => { loaded[traceId] = true; renderDetail(traceId, t); })
+            .catch(e => {
+              const wrap = detail.querySelector('.detail-wrap');
+              wrap.innerHTML = '<div style="color:var(--red);padding:12px">Failed to load trace: ' + esc(String(e)) + '</div>';
+            });
+        }
+      }
+    }
+
+    // ── Render detail view ────────────────────────────────────────
+    function renderDetail(traceId, trace) {
+      const wrap = document.querySelector('#detail-' + traceId + ' .detail-wrap');
+      const payload = trace.payload || {};
+      const events = payload.events || [];
+      const userMsg = payload.user_message || trace.user_message || '';
+      const assistantMsg = payload.final_message || trace.final_message || '';
+      const narratorSummary = payload.narrator_summary || '';
+
+      // Compute stats
+      let totalInput = 0, totalOutput = 0, totalCost = 0, totalMs = 0;
+      const significantEvents = [];
+      const modelsUsed = new Set();
+      const toolsUsed = [];
+
+      events.forEach(ev => {
+        const t = ev.event_type;
+        if (['agent_call', 'tool_result', 'sub_agent'].includes(t)) {
+          significantEvents.push(ev);
+        }
+        if (t === 'agent_call') {
+          const tok = ev.tokens || {};
+          const inp = tok.input || 0;
+          const out = tok.output || 0;
+          totalInput += inp;
+          totalOutput += out;
+          if (ev.model) modelsUsed.add(ev.model);
+          totalCost += calcCost(ev.model || '', inp, out);
+        }
+        if (t === 'tool_result' && ev.tool_name) toolsUsed.push(ev.tool_name);
+        if (t === 'sub_agent' && ev.model) modelsUsed.add(ev.model);
+        if (t === 'request_done' && ev.total_latency_ms != null) totalMs = ev.total_latency_ms;
+      });
+
+      if (!totalMs) {
+        totalMs = significantEvents.reduce((s, e) =>
+          s + (e.latency_ms || (e.span && e.span.duration_ms) || 0), 0);
+      }
+
+      let html = '';
+
+      // ── Narrator summary ──────────────────────────────────────
+      if (narratorSummary) {
+        html += '<div class="narrator-card">';
+        html += '<div class="narrator-label">&#x270E; Narrator Summary</div>';
+        html += '<div class="narrator-text">' + esc(narratorSummary) + '</div>';
+        html += '</div>';
+      }
+
+      // ── Summary cards ─────────────────────────────────────────
+      html += '<div class="summary-row">';
+      html += '<div class="summary-card cost"><div class="sc-label">Est. Cost</div>';
+      html += '<div class="sc-value">' + fmtCost(totalCost) + '</div>';
+      html += '<div class="sc-sub">input + output</div></div>';
+
+      html += '<div class="summary-card tokens"><div class="sc-label">Tokens</div>';
+      html += '<div class="sc-value">' + fmtTokens(totalInput + totalOutput) + '</div>';
+      html += '<div class="sc-sub">' + fmtTokens(totalInput) + ' in / ' + fmtTokens(totalOutput) + ' out</div></div>';
+
+      html += '<div class="summary-card duration"><div class="sc-label">Duration</div>';
+      html += '<div class="sc-value">' + fmtMs(totalMs) + '</div>';
+      html += '<div class="sc-sub">' + significantEvents.length + ' steps</div></div>';
+
+      html += '<div class="summary-card"><div class="sc-label">Models</div>';
+      html += '<div class="sc-value" style="font-size:11px;">' + (modelsUsed.size > 0 ? [...modelsUsed].map(m => '<span class="step-model-badge">' + esc(m) + '</span>').join(' ') : '-') + '</div>';
+      html += '<div class="sc-sub">' + modelsUsed.size + ' model' + (modelsUsed.size !== 1 ? 's' : '') + '</div></div>';
+      html += '</div>';
+
+      // ── Messages ──────────────────────────────────────────────
+      html += '<div class="messages-grid">';
+      html += '<div class="msg-card"><div class="mc-label"><span style="color:var(--blue)">&#x25B6;</span> User</div>';
+      html += '<div class="mc-text">' + esc(userMsg.slice(0, 500)) + (userMsg.length > 500 ? '&hellip;' : '') + '</div></div>';
+      html += '<div class="msg-card"><div class="mc-label"><span style="color:var(--green)">&#x25C0;</span> Assistant</div>';
+      html += '<div class="mc-text">' + esc(assistantMsg.slice(0, 500)) + (assistantMsg.length > 500 ? '&hellip;' : '') + '</div></div>';
+      html += '</div>';
+
+      // ── Visualization tabs: Sequence Diagram | Gantt Timeline | Waterfall ──
+      if (significantEvents.length > 0) {
+        const tid = traceId.replace(/[^a-z0-9]/gi, '').slice(0, 16);
+        html += '<div class="section-label">Visualization</div>';
+        html += '<div class="viz-tabs">';
+        html += '<button class="viz-tab active" data-panel="seq-' + tid + '">Sequence Diagram</button>';
+        html += '<button class="viz-tab" data-panel="gantt-' + tid + '">Gantt Timeline</button>';
+        html += '<button class="viz-tab" data-panel="wf-' + tid + '">Waterfall</button>';
+        html += '</div>';
+
+        // Panel 1: Mermaid sequence diagram
+        html += '<div class="viz-panel active" id="seq-' + tid + '">';
+        html += '<div class="mermaid-diagram" id="mermaid-' + tid + '">';
+        html += '<div class="mermaid-loading">Rendering sequence diagram...</div>';
+        html += '</div></div>';
+
+        // Panel 2: ECharts Gantt
+        const ganttH = Math.max(180, significantEvents.length * 32 + 60);
+        html += '<div class="viz-panel" id="gantt-' + tid + '">';
+        html += '<div class="gantt-chart" id="gantt-chart-' + tid + '" style="height:' + ganttH + 'px"></div>';
+        html += '</div>';
+
+        // Panel 3: Compact waterfall bar (original)
+        html += '<div class="viz-panel" id="wf-' + tid + '">';
+        html += '<div class="waterfall-bar" style="margin-bottom:4px">';
+        const rawMs = significantEvents.map(e => e.latency_ms || (e.span && e.span.duration_ms) || 0);
+        const sumMs = rawMs.reduce((a, b) => a + b, 0) || 1;
+        significantEvents.forEach((ev, i) => {
+          const dur = rawMs[i];
+          const pct = Math.max(2, (dur / sumMs) * 100);
+          const name = ev.name || ev.tool_name || ev.event_type;
+          const label = pct > 8 ? esc(name) : '';
+          const ttl = esc(name) + ' — ' + fmtMs(dur) + (ev.model ? ' (' + esc(ev.model) + ')' : '');
+          html += '<div class="wf-seg ' + (ev.event_type || '') + '" style="width:' + pct + '%" title="' + ttl + '">' + label + '</div>';
+        });
+        html += '</div>';
+        html += '<div class="waterfall-legend">';
+        html += '<div class="leg-item"><span class="leg-dot agent_call"></span> LLM Call</div>';
+        html += '<div class="leg-item"><span class="leg-dot tool_result"></span> Tool</div>';
+        html += '<div class="leg-item"><span class="leg-dot sub_agent"></span> Sub-agent</div>';
+        html += '</div></div>';
+        html += '<div style="height:16px"></div>';
+      }
+
+      // ── Step cards ────────────────────────────────────────────
+      html += '<div class="steps-section">';
+      html += '<div class="section-label">Steps (' + significantEvents.length + ')</div>';
+      significantEvents.forEach((ev, i) => {
+        html += renderStep(ev, i);
+      });
+      html += '</div>';
+
+      wrap.innerHTML = html;
+
+      // Attach step expand handlers
+      wrap.querySelectorAll('.step-header').forEach(el => {
+        el.addEventListener('click', () => el.closest('.step').classList.toggle('open'));
+      });
+
+      // Attach viz tab handlers
+      wrap.querySelectorAll('.viz-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const tabs = btn.parentElement;
+          tabs.querySelectorAll('.viz-tab').forEach(t => t.classList.remove('active'));
+          btn.classList.add('active');
+          const panelId = btn.dataset.panel;
+          const parent = tabs.parentElement;
+          parent.querySelectorAll('.viz-panel').forEach(p => p.classList.remove('active'));
+          const panel = document.getElementById(panelId);
+          if (panel) panel.classList.add('active');
+          // Lazy-init Gantt when first shown
+          if (panelId.startsWith('gantt-')) {
+            const chartEl = panel.querySelector('.gantt-chart');
+            if (chartEl && !chartEl._rendered) {
+              chartEl._rendered = true;
+              renderGanttChart(chartEl, significantEvents, totalMs);
+            }
+          }
+        });
+      });
+
+      // Render Mermaid sequence diagram
+      if (significantEvents.length > 0) {
+        const tid = traceId.replace(/[^a-z0-9]/gi, '').slice(0, 16);
+        const mermaidEl = document.getElementById('mermaid-' + tid);
+        if (mermaidEl) {
+          try {
+            const diagramText = buildMermaidDiagram(significantEvents, userMsg, assistantMsg);
+            mermaid.render('mm_' + tid + '_' + Date.now(), diagramText).then(({svg}) => {
+              mermaidEl.innerHTML = svg;
+            }).catch(err => {
+              mermaidEl.innerHTML = '<pre style="color:var(--text-muted);font-size:10px;padding:12px;white-space:pre-wrap">Diagram: ' + esc(String(err)) + '\n\nFallback:\n' + esc(diagramText) + '</pre>';
+            });
+          } catch (err) {
+            mermaidEl.innerHTML = '<pre style="color:var(--text-muted);font-size:10px;padding:12px">Build error: ' + esc(String(err)) + '</pre>';
+          }
+        }
+      }
+    }
+
+    // ── Render individual step card ───────────────────────────────
+    function renderStep(ev, idx) {
+      const type = ev.event_type || 'event';
+      const { title, typeLabel, desc, model, cost, tokens, dur, success, bodyHtml } = getStepInfo(ev);
+
+      let h = '<div class="step ' + type + '" data-idx="' + idx + '">';
+      h += '<div class="step-header">';
+      h += '<div class="step-header-left">';
+      h += '<span class="step-num">' + (idx + 1) + '</span>';
+      h += '<span class="step-type-badge">' + esc(typeLabel) + '</span>';
+      h += '<div style="min-width:0"><div class="step-name">' + esc(title) + '</div>';
+      if (desc) h += '<div class="step-desc">' + esc(desc) + '</div>';
+      h += '</div></div>';
+      h += '<div class="step-header-right">';
+      if (model) h += '<span class="step-model-badge">' + esc(model) + '</span>';
+      if (cost > 0) h += '<span class="step-cost-badge">' + fmtCost(cost) + '</span>';
+      if (tokens > 0) h += '<span class="step-tokens-badge">' + fmtTokens(tokens) + ' tok</span>';
+      h += '<span class="step-dur-badge">' + fmtMs(dur) + '</span>';
+      if (type === 'tool_result') h += '<span class="step-status-badge ' + (success ? 'ok' : 'fail') + '"></span>';
+      h += '<span class="step-expand-icon">&#x203A;</span>';
+      h += '</div></div>';
+
+      if (bodyHtml) {
+        h += '<div class="step-body">' + bodyHtml + '</div>';
+      }
+      h += '</div>';
+      return h;
+    }
+
+    function getStepInfo(ev) {
+      const type = ev.event_type;
+      let title = '', typeLabel = '', desc = '', model = '', cost = 0, tokens = 0, dur = 0, success = true, bodyHtml = '';
+
+      dur = ev.latency_ms || (ev.span && ev.span.duration_ms) || 0;
+
+      if (type === 'agent_call') {
+        typeLabel = 'LLM';
+        const name = ev.name || '';
+        title = name.replace('agent_turn_', 'Agent Turn ');
+        model = ev.model || '';
+        const tok = ev.tokens || {};
+        const inp = tok.input || 0;
+        const out = tok.output || 0;
+        tokens = inp + out;
+        cost = calcCost(model, inp, out);
+
+        // Description: what the agent did
+        const resp = ev.response || {};
+        const toolCalls = resp.tool_calls || [];
+        if (toolCalls.length > 0) {
+          desc = 'Called: ' + toolCalls.map(tc => tc.name).join(', ');
+        } else if (resp.content_preview) {
+          desc = resp.content_preview.slice(0, 120);
+        } else {
+          desc = 'Responded (stop: ' + (resp.stop_reason || '?') + ')';
+        }
+
+        // Body
+        let rows = '';
+        rows += '<div class="step-body-grid">';
+        rows += '<span class="sb-key">Provider</span><span class="sb-val">' + esc(ev.provider || '-') + '</span>';
+        rows += '<span class="sb-key">Model</span><span class="sb-val mono">' + esc(model) + '</span>';
+        rows += '<span class="sb-key">Tokens</span><span class="sb-val">';
+        rows += '<div class="token-bar-wrap">';
+        const total = inp + out || 1;
+        rows += '<div class="token-bar"><div class="tb-in" style="width:' + (inp / total * 100) + '%"></div><div class="tb-out" style="width:' + (out / total * 100) + '%"></div></div>';
+        rows += '<span class="token-bar-label">' + fmtTokens(inp) + ' in / ' + fmtTokens(out) + ' out</span>';
+        rows += '</div></span>';
+        rows += '<span class="sb-key">Cost</span><span class="sb-val mono" style="color:var(--green)">' + fmtCost(cost) + '</span>';
+        rows += '<span class="sb-key">Duration</span><span class="sb-val mono">' + fmtMs(dur) + '</span>';
+        if (resp.stop_reason) {
+          rows += '<span class="sb-key">Stop Reason</span><span class="sb-val">' + esc(resp.stop_reason) + '</span>';
+        }
+
+        // --- Agent's text response (what it said / decided) ---
+        if (resp.content_preview) {
+          rows += '<span class="sb-key">Agent Said</span><span class="sb-val" style="white-space:pre-wrap;max-height:200px;overflow-y:auto;display:block;background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--border);margin-top:4px">' + esc(resp.content_preview) + '</span>';
+        }
+
+        // --- Thinking blocks (the agent's internal reasoning) ---
+        if (resp.thinking && resp.thinking.length > 0) {
+          resp.thinking.forEach((block, ti) => {
+            rows += '<span class="sb-key">Thinking ' + (ti + 1) + '</span><span class="sb-val" style="white-space:pre-wrap;max-height:150px;overflow-y:auto;display:block;background:#1a1a10;padding:8px;border-radius:4px;border:1px solid #3a3a20;color:var(--amber);margin-top:4px;font-size:11px">' + esc(block) + '</span>';
+          });
+        }
+
+        // --- Tool calls with their actual input arguments ---
+        if (toolCalls.length) {
+          toolCalls.forEach(tc => {
+            let tcHtml = '<span class="step-type-badge" style="background:var(--green-bg);color:var(--green);margin-right:6px;font-size:10px">' + esc(tc.name) + '</span>';
+            if (tc.input && typeof tc.input === 'object') {
+              tcHtml += '<div style="margin-top:6px;background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--border);font-family:var(--mono);font-size:10px;max-height:150px;overflow-y:auto;white-space:pre-wrap">';
+              Object.entries(tc.input).forEach(([k, v]) => {
+                const val = String(v);
+                tcHtml += '<div style="margin-bottom:4px"><span style="color:var(--cyan)">' + esc(k) + '</span>: <span style="color:var(--text-secondary)">' + esc(val.slice(0, 500)) + (val.length > 500 ? '...' : '') + '</span></div>';
+              });
+              tcHtml += '</div>';
+            } else if (tc.input) {
+              tcHtml += '<div style="margin-top:4px;font-family:var(--mono);font-size:10px;color:var(--text-muted)">' + esc(String(tc.input).slice(0, 300)) + '</div>';
+            }
+            rows += '<span class="sb-key">Tool Call</span><span class="sb-val">' + tcHtml + '</span>';
+          });
+        }
+
+        // Prompt context
+        const prompt = ev.prompt || {};
+        rows += '<span class="sb-key">Prompt Info</span><span class="sb-val mono">system=' + (prompt.system_len || 0) + ' chars, ' + (prompt.messages_count || 0) + ' msgs, ' + (prompt.tools_count || 0) + ' tools</span>';
+        if (prompt.last_message_preview) {
+          rows += '<span class="sb-key">Last Input</span><span class="sb-val" style="white-space:pre-wrap;max-height:120px;overflow-y:auto;display:block;background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--border);margin-top:4px;font-size:11px"><span style="color:var(--text-muted)">(' + esc(prompt.last_message_role || '?') + ')</span> ' + esc(prompt.last_message_preview) + '</span>';
+        }
+        rows += '</div>';
+        bodyHtml = rows;
+
+      } else if (type === 'tool_result') {
+        typeLabel = 'TOOL';
+        title = ev.tool_name || '?';
+        success = ev.success !== false;
+
+        // Identify image generation tools
+        const imageTools = ['generate_images', 'generate_hero_image', 'generate_infographic', 'approve_hero_image', 'approve_infographic'];
+        if (imageTools.includes(title)) {
+          typeLabel = 'IMAGE';
+        }
+
+        const args = ev.args_sanitized || {};
+        const argParts = Object.entries(args).slice(0, 3).map(([k, v]) => k + '=' + String(v).slice(0, 50));
+        desc = argParts.length ? argParts.join(', ') : (ev.result_preview || '').slice(0, 100);
+
+        let rows = '<div class="step-body-grid">';
+        // Show each argument clearly
+        if (Object.keys(args).length) {
+          rows += '<span class="sb-key">Arguments</span><span class="sb-val">';
+          rows += '<div style="background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--border);font-family:var(--mono);font-size:10px;max-height:200px;overflow-y:auto">';
+          Object.entries(args).forEach(([k, v]) => {
+            const val = String(v);
+            rows += '<div style="margin-bottom:4px"><span style="color:var(--cyan)">' + esc(k) + '</span>: <span style="color:var(--text-secondary)">' + esc(val.slice(0, 500)) + (val.length > 500 ? '...' : '') + '</span></div>';
+          });
+          rows += '</div></span>';
+        }
+        // Show result with more space
+        if (ev.result_preview) {
+          rows += '<span class="sb-key">Result</span><span class="sb-val" style="white-space:pre-wrap;max-height:200px;overflow-y:auto;display:block;background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--border);margin-top:4px">' + esc(ev.result_preview) + '</span>';
+        }
+        if (ev.error) {
+          rows += '<span class="sb-key">Error</span><span class="sb-val" style="color:var(--red);background:var(--red-bg);padding:6px 8px;border-radius:4px">' + esc(ev.error) + '</span>';
+        }
+        rows += '<span class="sb-key">Duration</span><span class="sb-val mono">' + fmtMs(dur) + '</span>';
+        rows += '<span class="sb-key">Status</span><span class="sb-val">' + (success ? '<span style="color:var(--green)">Success</span>' : '<span style="color:var(--red)">Failed</span>') + '</span>';
+        rows += '</div>';
+        bodyHtml = rows;
+
+      } else if (type === 'sub_agent') {
+        typeLabel = 'AGENT';
+        title = (ev.name || '?');
+        model = ev.model || '';
+        const provider = ev.provider || '?';
+        desc = 'via ' + provider + (model ? ' (' + model + ')' : '') + ' — ' + (ev.output_size || 0) + ' chars output';
+
+        // Sub-agents may have tokens
+        const tok = ev.tokens || {};
+        if (tok.input || tok.output) {
+          tokens = (tok.input || 0) + (tok.output || 0);
+          cost = calcCost(model, tok.input || 0, tok.output || 0);
+        }
+
+        let rows = '<div class="step-body-grid">';
+        rows += '<span class="sb-key">Provider</span><span class="sb-val">' + esc(provider) + '</span>';
+        if (model) rows += '<span class="sb-key">Model</span><span class="sb-val mono">' + esc(model) + '</span>';
+        rows += '<span class="sb-key">Output Size</span><span class="sb-val mono">' + (ev.output_size || 0) + ' chars</span>';
+        rows += '<span class="sb-key">Input Keys</span><span class="sb-val">' + esc((ev.input_keys || []).join(', ')) + '</span>';
+        rows += '<span class="sb-key">Duration</span><span class="sb-val mono">' + fmtMs(dur) + '</span>';
+        rows += '<span class="sb-key">Status</span><span class="sb-val">' + (ev.status === 'success' ? '<span style="color:var(--green)">Success</span>' : '<span style="color:var(--red)">' + esc(ev.status) + '</span>') + '</span>';
+        if (tokens > 0) {
+          rows += '<span class="sb-key">Tokens</span><span class="sb-val mono">' + fmtTokens(tokens) + '</span>';
+          rows += '<span class="sb-key">Cost</span><span class="sb-val mono" style="color:var(--green)">' + fmtCost(cost) + '</span>';
+        }
+        rows += '</div>';
+        bodyHtml = rows;
+      }
+
+      // Add raw JSON toggle to all step bodies
+      if (bodyHtml) {
+        bodyHtml += '<details class="raw-toggle"><summary>View raw event JSON</summary>';
+        bodyHtml += '<pre class="raw-json">' + esc(JSON.stringify(ev, null, 2)) + '</pre></details>';
+      }
+
+      return { title, typeLabel, desc, model, cost, tokens, dur, success, bodyHtml };
+    }
+
+    // ── Mermaid sequence diagram builder ───────────────────────
+    function sanitizeId(s) {
+      return (s || 'x').replace(/[^a-zA-Z0-9]/g, '_').slice(0, 30);
+    }
+    function sanitizeMermaid(s) {
+      if (!s) return '...';
+      return s.replace(/[;:#"'`<>{}|\\&\n\r]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || '...';
+    }
+
+    function buildMermaidDiagram(events, userMsg, assistantMsg) {
+      // Collect unique participants
+      const toolParticipants = new Map();
+      const subParticipants = new Map();
+      let agentModel = '';
+
+      events.forEach(ev => {
+        if (ev.event_type === 'agent_call' && ev.model && !agentModel) agentModel = ev.model;
+        if (ev.event_type === 'tool_result' && ev.tool_name) {
+          const id = 'T_' + sanitizeId(ev.tool_name);
+          if (!toolParticipants.has(id)) toolParticipants.set(id, ev.tool_name);
+        }
+        if (ev.event_type === 'sub_agent' && ev.name) {
+          const id = 'S_' + sanitizeId(ev.name);
+          if (!subParticipants.has(id)) {
+            subParticipants.set(id, ev.name + (ev.provider ? ' (' + ev.provider + ')' : ''));
+          }
+        }
+      });
+
+      let d = 'sequenceDiagram\n';
+      d += '    participant U as User\n';
+      d += '    participant A as Agent' + (agentModel ? '<br/>' + agentModel : '') + '\n';
+      for (const [id, name] of toolParticipants) {
+        d += '    participant ' + id + ' as ' + sanitizeMermaid(name) + '\n';
+      }
+      for (const [id, name] of subParticipants) {
+        d += '    participant ' + id + ' as ' + sanitizeMermaid(name) + '\n';
+      }
+
+      // User message
+      d += '    U->>A: ' + sanitizeMermaid(userMsg.slice(0, 70)) + '\n';
+
+      // Build a map of tool call inputs from agent_call events
+      // so we can show what the agent sent to each tool
+      const pendingToolInputs = new Map(); // tool_name -> input summary
+
+      events.forEach(ev => {
+        if (ev.event_type === 'agent_call') {
+          const tok = ev.tokens || {};
+          const total = (tok.input || 0) + (tok.output || 0);
+          const cost = calcCost(ev.model || '', tok.input || 0, tok.output || 0);
+          const name = (ev.name || '').replace('agent_turn_', 'Turn ');
+          const resp = ev.response || {};
+          const toolCalls = resp.tool_calls || [];
+
+          // Show what the agent decided / said
+          let note = name;
+          if (ev.model) note += ' - ' + ev.model;
+          if (total > 0) note += ' - ' + total.toLocaleString() + ' tok';
+          if (cost > 0) note += ' - ' + fmtCost(cost);
+          d += '    Note over A: ' + sanitizeMermaid(note) + '\n';
+
+          // If agent produced text (not just tool calls), show it
+          if (resp.content_preview && !toolCalls.length) {
+            d += '    Note right of A: ' + sanitizeMermaid(resp.content_preview.slice(0, 80)) + '\n';
+          }
+
+          // Collect tool call inputs for upcoming tool_result events
+          toolCalls.forEach(tc => {
+            let inputSummary = '';
+            if (tc.input && typeof tc.input === 'object') {
+              const entries = Object.entries(tc.input).slice(0, 2);
+              inputSummary = entries.map(([k, v]) => k + '=' + String(v).slice(0, 40)).join(', ');
+            } else if (tc.input) {
+              inputSummary = String(tc.input).slice(0, 50);
+            }
+            pendingToolInputs.set(tc.name, inputSummary);
+          });
+        }
+
+        if (ev.event_type === 'tool_result') {
+          const id = 'T_' + sanitizeId(ev.tool_name || '?');
+          const dur = fmtMs(ev.latency_ms || 0);
+          const ok = ev.success !== false;
+
+          // Use the pending tool input from the agent's decision if available
+          let arrowLabel = pendingToolInputs.get(ev.tool_name) || '';
+          if (!arrowLabel) {
+            // Fallback to tool's own args
+            const args = ev.args_sanitized || {};
+            arrowLabel = Object.entries(args).slice(0, 2).map(([k, v]) => k + '=' + String(v).slice(0, 30)).join(', ');
+          }
+          pendingToolInputs.delete(ev.tool_name);
+
+          d += '    A->>' + id + ': ' + sanitizeMermaid(arrowLabel || 'execute') + '\n';
+
+          // Show result preview on the return arrow
+          let resultLabel = (ok ? 'ok' : 'FAIL') + ' ' + dur;
+          if (ev.result_preview) {
+            resultLabel += ' - ' + ev.result_preview.slice(0, 40);
+          }
+          d += '    ' + id + '-->>A: ' + sanitizeMermaid(resultLabel) + '\n';
+        }
+
+        if (ev.event_type === 'sub_agent') {
+          const id = 'S_' + sanitizeId(ev.name || '?');
+          const dur = fmtMs(ev.latency_ms || 0);
+          const ok = ev.status === 'success';
+          const inputStr = (ev.input_keys || []).join(', ');
+          d += '    A->>' + id + ': ' + sanitizeMermaid(inputStr || 'invoke') + '\n';
+          d += '    ' + id + '-->>A: ' + (ok ? 'ok' : 'FAIL') + ' ' + (ev.output_size || 0) + ' chars ' + dur + '\n';
+        }
+      });
+
+      // Final response
+      if (assistantMsg) {
+        d += '    A-->>U: ' + sanitizeMermaid(assistantMsg.slice(0, 60)) + '\n';
+      }
+      return d;
+    }
+
+    // ── ECharts Gantt chart ───────────────────────────────────
+    function renderGanttChart(container, events, totalMs) {
+      if (!container || !events.length || typeof echarts === 'undefined') return;
+
+      const chart = echarts.init(container, null, { renderer: 'canvas' });
+
+      const categories = [];
+      const offsets = [];
+      const durations = [];
+      const colors = [];
+      const evRef = [];
+
+      let cumulative = 0;
+      events.forEach((ev, i) => {
+        const name = ev.name || ev.tool_name || ev.event_type;
+        const model = ev.model || '';
+        const label = (i + 1) + '. ' + name + (model ? ' (' + model + ')' : '');
+        const dur = ev.latency_ms || (ev.span && ev.span.duration_ms) || 0;
+
+        categories.push(label);
+        offsets.push(cumulative);
+        durations.push(dur);
+        evRef.push(ev);
+
+        const type = ev.event_type;
+        colors.push(type === 'agent_call' ? '#3b82f6' : type === 'tool_result' ? '#10b981' : type === 'sub_agent' ? '#f59e0b' : '#6b6b7a');
+
+        cumulative += dur;
+      });
+
+      const option = {
+        backgroundColor: 'transparent',
+        tooltip: {
+          trigger: 'axis',
+          axisPointer: { type: 'shadow' },
+          backgroundColor: '#1c1c24',
+          borderColor: '#32323c',
+          textStyle: { color: '#e8e8ed', fontSize: 11, fontFamily: 'Inter, sans-serif' },
+          formatter: function(params) {
+            const idx = params[0].dataIndex;
+            const rev = events.length - 1 - idx;
+            const ev = evRef[rev];
+            const dur = durations[rev];
+            let t = '<b style="color:#e8e8ed">' + esc(categories[rev]) + '</b><br/>';
+            t += '<span style="color:#6b6b7a">Duration:</span> ' + fmtMs(dur) + '<br/>';
+            if (ev.model) t += '<span style="color:#6b6b7a">Model:</span> <span style="color:#a855f7">' + esc(ev.model) + '</span><br/>';
+            if (ev.tokens) {
+              const inp = ev.tokens.input || 0, out = ev.tokens.output || 0;
+              t += '<span style="color:#6b6b7a">Tokens:</span> ' + fmtTokens(inp + out) + ' (' + fmtTokens(inp) + ' in / ' + fmtTokens(out) + ' out)<br/>';
+              t += '<span style="color:#6b6b7a">Cost:</span> <span style="color:#10b981">' + fmtCost(calcCost(ev.model || '', inp, out)) + '</span><br/>';
+            }
+            if (ev.tool_name) t += '<span style="color:#6b6b7a">Tool:</span> ' + esc(ev.tool_name) + '<br/>';
+            if (ev.provider) t += '<span style="color:#6b6b7a">Provider:</span> ' + esc(ev.provider) + '<br/>';
+            return t;
+          }
+        },
+        grid: { left: 220, right: 50, top: 10, bottom: 30 },
+        xAxis: {
+          type: 'value',
+          name: 'ms',
+          nameTextStyle: { color: '#6b6b7a', fontSize: 10 },
+          axisLabel: { color: '#6b6b7a', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' },
+          splitLine: { lineStyle: { color: '#1c1c24' } },
+          axisLine: { lineStyle: { color: '#27272f' } },
+        },
+        yAxis: {
+          type: 'category',
+          data: [...categories].reverse(),
+          axisLabel: {
+            color: '#a0a0ad', fontSize: 10,
+            fontFamily: 'Inter, sans-serif',
+            width: 200, overflow: 'truncate',
+          },
+          axisTick: { show: false },
+          axisLine: { lineStyle: { color: '#27272f' } },
+          splitLine: { show: false },
+        },
+        series: [
+          {
+            name: 'offset',
+            type: 'bar',
+            stack: 'time',
+            itemStyle: { color: 'transparent', borderWidth: 0 },
+            data: [...offsets].reverse(),
+            emphasis: { disabled: true },
+            tooltip: { show: false },
+          },
+          {
+            name: 'duration',
+            type: 'bar',
+            stack: 'time',
+            barWidth: 18,
+            data: [...durations].reverse().map((d, i) => ({
+              value: d,
+              itemStyle: {
+                color: [...colors].reverse()[i],
+                borderRadius: [0, 4, 4, 0],
+              },
+            })),
+            label: {
+              show: true,
+              position: 'right',
+              formatter: function(p) { return fmtMs(p.value); },
+              color: '#6b6b7a',
+              fontSize: 10,
+              fontFamily: 'JetBrains Mono, monospace',
+            },
+          },
+        ],
+      };
+
+      chart.setOption(option);
+
+      // Responsive resize
+      const ro = new ResizeObserver(() => chart.resize());
+      ro.observe(container);
+    }
+  </script>
+</body>
+</html>

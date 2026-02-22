@@ -1,0 +1,723 @@
+{
+    "name": "Integration Tools, PromptLayer",
+    "flow": [
+        {
+            "id": 2,
+            "module": "util:SetVariables",
+            "version": 1,
+            "parameters": {},
+            "mapper": {
+                "scope": "roundtrip",
+                "variables": [
+                    {
+                        "name": "topic",
+                        "value": "Why is this LLM failing intermittently?"
+                    }
+                ]
+            },
+            "metadata": {
+                "designer": {
+                    "x": 0,
+                    "y": 0
+                },
+                "restore": {
+                    "expect": {
+                        "scope": {
+                            "label": "One cycle"
+                        },
+                        "variables": {
+                            "items": [
+                                null
+                            ]
+                        }
+                    }
+                },
+                "expect": [
+                    {
+                        "name": "variables",
+                        "spec": [
+                            {
+                                "name": "name",
+                                "type": "text",
+                                "label": "Variable name",
+                                "required": true
+                            },
+                            {
+                                "name": "value",
+                                "type": "any",
+                                "label": "Variable value"
+                            }
+                        ],
+                        "type": "array",
+                        "label": "Variables"
+                    },
+                    {
+                        "name": "scope",
+                        "type": "select",
+                        "label": "Variable lifetime",
+                        "required": true,
+                        "validate": {
+                            "enum": [
+                                "roundtrip",
+                                "execution"
+                            ]
+                        }
+                    }
+                ],
+                "interface": [
+                    {
+                        "name": "topic",
+                        "type": "any",
+                        "label": "topic"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 5,
+            "module": "google-docs:listDocuments",
+            "version": 1,
+            "parameters": {
+                "__IMTCONN__": 3975780
+            },
+            "mapper": {
+                "limit": "3200",
+                "folderId": "/1GcFBbFCV5DoKlRRTP_r0QFX2CvWEm1Vm/1lOs_t-CmV40E1JyXQma9KpgF9gzEQGNK",
+                "destination": "drive"
+            },
+            "metadata": {
+                "designer": {
+                    "x": 300,
+                    "y": 0
+                },
+                "restore": {
+                    "expect": {
+                        "folderId": {
+                            "mode": "chose",
+                            "path": [
+                                "PromptLayer",
+                                "DeepReserach"
+                            ]
+                        },
+                        "destination": {
+                            "label": "My Drive"
+                        }
+                    },
+                    "parameters": {
+                        "__IMTCONN__": {
+                            "data": {
+                                "scoped": "true",
+                                "connection": "google"
+                            },
+                            "label": "My Google connection (yonash8@gmail.com)"
+                        }
+                    }
+                },
+                "parameters": [
+                    {
+                        "name": "__IMTCONN__",
+                        "type": "account:google",
+                        "label": "Connection",
+                        "required": true
+                    }
+                ],
+                "expect": [
+                    {
+                        "name": "destination",
+                        "type": "select",
+                        "label": "Choose a Drive",
+                        "required": true,
+                        "validate": {
+                            "enum": [
+                                "drive",
+                                "share",
+                                "team"
+                            ]
+                        }
+                    },
+                    {
+                        "name": "limit",
+                        "type": "uinteger",
+                        "label": "Limit"
+                    },
+                    {
+                        "name": "folderId",
+                        "type": "folder",
+                        "label": "Folder ID"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 7,
+            "module": "builtin:BasicAggregator",
+            "version": 1,
+            "parameters": {
+                "feeder": 5
+            },
+            "mapper": {
+                "id": "{{5.id}}",
+                "name": "{{5.name}}"
+            },
+            "metadata": {
+                "designer": {
+                    "x": 600,
+                    "y": 0
+                },
+                "restore": {
+                    "extra": {
+                        "feeder": {
+                            "label": "Google Docs - List Documents [5]"
+                        },
+                        "target": {
+                            "label": "Custom"
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "id": 8,
+            "module": "google-docs:getADocument",
+            "version": 1,
+            "parameters": {
+                "__IMTCONN__": 3975780
+            },
+            "mapper": {
+                "filter": "image",
+                "select": "map",
+                "document": "{{map(7.array; \"id\"; \"name\"; 2.topic)}}",
+                "includeTabsContent": false
+            },
+            "metadata": {
+                "designer": {
+                    "x": 900,
+                    "y": 0
+                },
+                "restore": {
+                    "expect": {
+                        "filter": {
+                            "label": "Image"
+                        },
+                        "select": {
+                            "label": "By Mapping"
+                        }
+                    },
+                    "parameters": {
+                        "__IMTCONN__": {
+                            "data": {
+                                "scoped": "true",
+                                "connection": "google"
+                            },
+                            "label": "My Google connection (yonash8@gmail.com)"
+                        }
+                    }
+                },
+                "parameters": [
+                    {
+                        "name": "__IMTCONN__",
+                        "type": "account:google",
+                        "label": "Connection",
+                        "required": true
+                    }
+                ],
+                "expect": [
+                    {
+                        "name": "select",
+                        "type": "select",
+                        "label": "Get Content of a Document",
+                        "required": true,
+                        "validate": {
+                            "enum": [
+                                "map",
+                                "dropdown"
+                            ]
+                        }
+                    },
+                    {
+                        "name": "includeTabsContent",
+                        "type": "boolean",
+                        "label": "Include Tabs Content",
+                        "required": true
+                    },
+                    {
+                        "name": "filter",
+                        "type": "select",
+                        "label": "Filter",
+                        "required": true,
+                        "validate": {
+                            "enum": [
+                                "image",
+                                "drawing",
+                                "chart"
+                            ]
+                        }
+                    },
+                    {
+                        "name": "document",
+                        "type": "text",
+                        "label": "Document ID",
+                        "required": true
+                    }
+                ]
+            }
+        },
+        {
+            "id": 3,
+            "module": "tavily:search",
+            "version": 1,
+            "parameters": {
+                "topic": "general",
+                "time_range": "",
+                "__IMTCONN__": 4662830,
+                "max_results": 20,
+                "search_depth": "advanced",
+                "include_answer": false,
+                "include_images": false,
+                "auto_parameters": false,
+                "exclude_domains": [],
+                "include_domains": [],
+                "chunks_per_source": 3,
+                "include_raw_content": false,
+                "include_image_descriptions": false
+            },
+            "mapper": {
+                "query": "Find authoritative and relevant sources explaining {{2.topic}}. Prefer high-quality articles, engineering blogs, academic papers, postmortems, and official documentation.\r\n"
+            },
+            "metadata": {
+                "designer": {
+                    "x": 1200,
+                    "y": 0
+                },
+                "restore": {
+                    "parameters": {
+                        "topic": {
+                            "label": "General"
+                        },
+                        "__IMTCONN__": {
+                            "data": {
+                                "scoped": "true",
+                                "connection": "tavily"
+                            },
+                            "label": "My Tavily connection"
+                        },
+                        "search_depth": {
+                            "label": "Advanced"
+                        },
+                        "include_favicon": {
+                            "empty": true
+                        }
+                    }
+                },
+                "parameters": [
+                    {
+                        "name": "__IMTCONN__",
+                        "type": "account:tavily",
+                        "label": "Connection",
+                        "required": true
+                    },
+                    {
+                        "name": "topic",
+                        "type": "select",
+                        "label": "Topic",
+                        "validate": {
+                            "enum": [
+                                "general",
+                                "news",
+                                "finance"
+                            ]
+                        }
+                    },
+                    {
+                        "name": "search_depth",
+                        "type": "select",
+                        "label": "Search Depth",
+                        "validate": {
+                            "enum": [
+                                "basic",
+                                "advanced"
+                            ]
+                        }
+                    },
+                    {
+                        "name": "chunks_per_source",
+                        "type": "integer",
+                        "label": "Chunks per Source (Available only when search_depth is advanced)"
+                    },
+                    {
+                        "name": "max_results",
+                        "type": "integer",
+                        "label": "Max Results"
+                    },
+                    {
+                        "name": "time_range",
+                        "type": "select",
+                        "label": "Time Range",
+                        "validate": {
+                            "enum": [
+                                "day",
+                                "week",
+                                "month",
+                                "year"
+                            ]
+                        }
+                    },
+                    {
+                        "name": "include_answer",
+                        "type": "boolean",
+                        "label": "Include Answer"
+                    },
+                    {
+                        "name": "include_raw_content",
+                        "type": "boolean",
+                        "label": "Include Raw Content"
+                    },
+                    {
+                        "name": "include_images",
+                        "type": "boolean",
+                        "label": "Include Images"
+                    },
+                    {
+                        "name": "include_image_descriptions",
+                        "type": "boolean",
+                        "label": "Include Image Descriptions (Available only if include_images is true)"
+                    },
+                    {
+                        "name": "include_domains",
+                        "spec": {
+                            "name": "value",
+                            "type": "text"
+                        },
+                        "type": "array",
+                        "label": "Include Domains"
+                    },
+                    {
+                        "name": "exclude_domains",
+                        "spec": {
+                            "name": "value",
+                            "type": "text"
+                        },
+                        "type": "array",
+                        "label": "Exclude Domains"
+                    },
+                    {
+                        "name": "include_favicon",
+                        "type": "boolean",
+                        "label": "Include Favicon"
+                    },
+                    {
+                        "name": "auto_parameters",
+                        "type": "boolean",
+                        "label": "Auto Parameters"
+                    }
+                ],
+                "expect": [
+                    {
+                        "name": "query",
+                        "type": "text",
+                        "label": "Query",
+                        "required": true
+                    },
+                    {
+                        "name": "start_date",
+                        "type": "text",
+                        "label": "Start Date (Required to be written in the format YYYY-MM-DD)"
+                    },
+                    {
+                        "name": "end_date",
+                        "type": "text",
+                        "label": "End Date (Required to be written in the format YYYY-MM-DD)"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 9,
+            "module": "json:CreateJSON",
+            "version": 1,
+            "parameters": {
+                "type": 266880,
+                "space": ""
+            },
+            "mapper": {
+                "topic": "{{2.topic}}",
+                "llm_deep_reserach": "{{8.text}}{{3.results}}"
+            },
+            "metadata": {
+                "designer": {
+                    "x": 1500,
+                    "y": 0
+                },
+                "restore": {
+                    "parameters": {
+                        "type": {
+                            "label": "My data structure"
+                        },
+                        "space": {
+                            "label": "Empty"
+                        }
+                    }
+                },
+                "parameters": [
+                    {
+                        "name": "type",
+                        "type": "udt",
+                        "label": "Data structure",
+                        "required": true
+                    },
+                    {
+                        "name": "space",
+                        "type": "select",
+                        "label": "Indentation",
+                        "validate": {
+                            "enum": [
+                                "tab",
+                                "2",
+                                "4"
+                            ]
+                        }
+                    }
+                ],
+                "expect": [
+                    {
+                        "name": "topic",
+                        "type": "text",
+                        "label": null,
+                        "required": true
+                    },
+                    {
+                        "name": "llm_deep_reserach",
+                        "type": "text",
+                        "label": null
+                    }
+                ]
+            }
+        },
+        {
+            "id": 1,
+            "module": "promptlayer:agent",
+            "version": 1,
+            "parameters": {
+                "agentName": "seo agent",
+                "returnAll": false,
+                "__IMTCONN__": 4662800
+            },
+            "mapper": {
+                "inputVars": "{{9.json}}"
+            },
+            "metadata": {
+                "designer": {
+                    "x": 1800,
+                    "y": 0
+                },
+                "restore": {
+                    "parameters": {
+                        "__IMTCONN__": {
+                            "data": {
+                                "scoped": "true",
+                                "connection": "promptlayer"
+                            },
+                            "label": "My PromptLayer API Key connection"
+                        }
+                    }
+                },
+                "parameters": [
+                    {
+                        "name": "__IMTCONN__",
+                        "type": "account:promptlayer",
+                        "label": "Connection",
+                        "required": true
+                    },
+                    {
+                        "name": "agentName",
+                        "type": "text",
+                        "label": "Agent name",
+                        "required": true
+                    },
+                    {
+                        "name": "returnAll",
+                        "type": "boolean",
+                        "label": "Return all outputs"
+                    }
+                ],
+                "expect": [
+                    {
+                        "name": "inputVars",
+                        "type": "text",
+                        "label": "Input variables (JSON)"
+                    },
+                    {
+                        "name": "metadata",
+                        "type": "text",
+                        "label": "Metadata (JSON)"
+                    }
+                ]
+            }
+        },
+        {
+            "id": 11,
+            "module": "markdown:Compile",
+            "version": 2,
+            "parameters": {},
+            "mapper": {
+                "gfm": true,
+                "data": "{{1.value}}",
+                "sanitize": false
+            },
+            "metadata": {
+                "designer": {
+                    "x": 2100,
+                    "y": 0
+                },
+                "restore": {
+                    "expect": {
+                        "gfm": {
+                            "mode": "chose"
+                        },
+                        "sanitize": {
+                            "mode": "chose"
+                        }
+                    }
+                },
+                "expect": [
+                    {
+                        "name": "data",
+                        "type": "text",
+                        "label": "Markdown"
+                    },
+                    {
+                        "name": "gfm",
+                        "type": "boolean",
+                        "label": "GitHub Flavored Markdown",
+                        "required": true
+                    },
+                    {
+                        "name": "sanitize",
+                        "type": "boolean",
+                        "label": "Sanitize",
+                        "required": true
+                    }
+                ]
+            }
+        },
+        {
+            "id": 10,
+            "module": "google-docs:createADocument",
+            "version": 1,
+            "parameters": {
+                "__IMTCONN__": 3975780
+            },
+            "mapper": {
+                "name": "{{2.topic}}",
+                "footer": false,
+                "header": false,
+                "content": "{{11.data}}",
+                "folderId": "/1GcFBbFCV5DoKlRRTP_r0QFX2CvWEm1Vm",
+                "destination": "drive"
+            },
+            "metadata": {
+                "designer": {
+                    "x": 2400,
+                    "y": 0
+                },
+                "restore": {
+                    "expect": {
+                        "folderId": {
+                            "mode": "chose",
+                            "path": [
+                                "PromptLayer"
+                            ]
+                        },
+                        "destination": {
+                            "label": "My Drive"
+                        }
+                    },
+                    "parameters": {
+                        "__IMTCONN__": {
+                            "data": {
+                                "scoped": "true",
+                                "connection": "google"
+                            },
+                            "label": "My Google connection (yonash8@gmail.com)"
+                        }
+                    }
+                },
+                "parameters": [
+                    {
+                        "name": "__IMTCONN__",
+                        "type": "account:google",
+                        "label": "Connection",
+                        "required": true
+                    }
+                ],
+                "expect": [
+                    {
+                        "name": "name",
+                        "type": "text",
+                        "label": "Name",
+                        "required": true
+                    },
+                    {
+                        "name": "content",
+                        "type": "text",
+                        "label": "Content",
+                        "required": true
+                    },
+                    {
+                        "name": "destination",
+                        "type": "select",
+                        "label": "Choose a Drive",
+                        "required": true,
+                        "validate": {
+                            "enum": [
+                                "drive",
+                                "share",
+                                "team"
+                            ]
+                        }
+                    },
+                    {
+                        "name": "header",
+                        "type": "boolean",
+                        "label": "Insert a Header",
+                        "required": true
+                    },
+                    {
+                        "name": "footer",
+                        "type": "boolean",
+                        "label": "Insert a Footer",
+                        "required": true
+                    },
+                    {
+                        "name": "folderId",
+                        "type": "folder",
+                        "label": "New Document's Location",
+                        "required": true
+                    }
+                ],
+                "advanced": true
+            }
+        }
+    ],
+    "metadata": {
+        "instant": false,
+        "version": 1,
+        "scenario": {
+            "roundtrips": 1,
+            "maxErrors": 3,
+            "autoCommit": true,
+            "autoCommitTriggerLast": true,
+            "sequential": false,
+            "slots": null,
+            "confidential": false,
+            "dataloss": false,
+            "dlq": false,
+            "freshVariables": false
+        },
+        "designer": {
+            "orphans": []
+        },
+        "zone": "us1.make.com",
+        "notes": []
+    }
+}

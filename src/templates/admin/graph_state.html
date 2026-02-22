@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Graph State Viewer</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149; --orange: #db6d28; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+  h1 { font-size: 1.4em; margin-bottom: 16px; }
+  .controls { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; flex-wrap: wrap; }
+  .controls select, .controls button { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: 6px; font-size: 14px; cursor: pointer; }
+  .controls button { background: var(--accent); color: #fff; border: none; font-weight: 600; }
+  .controls button:hover { opacity: 0.9; }
+  .auto-label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+  .auto-label input { accent-color: var(--accent); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card h2 { font-size: 1em; color: var(--accent); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.green { background: var(--green); }
+  .dot.yellow { background: var(--yellow); }
+  .dot.red { background: var(--red); }
+  .dot.orange { background: var(--orange); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table td { padding: 4px 8px; vertical-align: top; border-bottom: 1px solid var(--border); }
+  table td:first-child { color: var(--muted); white-space: nowrap; width: 180px; font-weight: 500; }
+  table td:last-child { word-break: break-all; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .badge.stage { background: #1f3a5f; color: var(--accent); }
+  .badge.paused { background: #3d2e00; color: var(--yellow); }
+  .badge.idle { background: #1a1e23; color: var(--muted); }
+  .log-entry { font-size: 12px; color: var(--muted); padding: 2px 0; border-bottom: 1px solid var(--border); }
+  .log-entry .action { color: var(--accent); font-weight: 500; }
+  .empty { color: var(--muted); font-style: italic; padding: 20px; text-align: center; }
+  #error { color: var(--red); margin-bottom: 10px; display: none; }
+  .thread-list { list-style: none; }
+  .thread-list li { padding: 8px 12px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 13px; }
+  .thread-list li:hover { background: #1f2937; }
+  .thread-list li .uid { color: var(--accent); }
+  .timestamp { font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>Graph State Viewer</h1>
+<div id="error"></div>
+
+<div class="controls">
+  <select id="userSelect"><option value="">Loading threads...</option></select>
+  <button onclick="refresh()">Refresh</button>
+  <label class="auto-label"><input type="checkbox" id="autoRefresh" checked> Auto-refresh (3s)</label>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2><span class="dot" id="statusDot"></span> Thread Info</h2>
+    <table id="threadTable"><tr><td colspan="2" class="empty">Select a user above</td></tr></table>
+  </div>
+  <div class="card">
+    <h2>Graph Position</h2>
+    <table id="graphTable"><tr><td colspan="2" class="empty">—</td></tr></table>
+  </div>
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Full State</h2>
+    <table id="stateTable"><tr><td colspan="2" class="empty">—</td></tr></table>
+  </div>
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Actions Log (last 10)</h2>
+    <div id="actionsLog"><div class="empty">—</div></div>
+  </div>
+</div>
+
+<script>
+const API = '/api/admin/graph-state';
+let timer = null;
+
+async function loadThreads() {
+  try {
+    const r = await fetch(API);
+    const ct = r.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) {
+      throw new Error('Server returned non-JSON: ' + (await r.text()).slice(0, 100));
+    }
+    const d = await r.json();
+    const sel = document.getElementById('userSelect');
+    sel.innerHTML = '<option value="">— select user —</option>';
+    (d.threads || []).forEach(t => {
+      const o = document.createElement('option');
+      o.value = t.whatsapp_user_id;
+      const uid = t.whatsapp_user_id.replace('@c.us', '');
+      o.textContent = uid + (t.article_id ? ' [' + t.article_id.slice(0,8) + ']' : ' [no article]');
+      sel.appendChild(o);
+    });
+    sel.onchange = () => refresh();
+  } catch(e) { showError(e.message); }
+}
+
+async function refresh() {
+  const uid = document.getElementById('userSelect').value;
+  if (!uid) return;
+  try {
+    const r = await fetch(API + '?whatsapp_user_id=' + encodeURIComponent(uid));
+    const ct = r.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) {
+      const txt = await r.text();
+      throw new Error('Server error (' + r.status + '): ' + txt.slice(0, 150));
+    }
+    const d = await r.json();
+    if (d.error) showError(d.error);
+    else hideError();
+    renderThread(d);
+    renderGraph(d);
+    renderState(d.state);
+    renderActions(d.state);
+  } catch(e) { showError(e.message); }
+}
+
+function renderThread(d) {
+  const t = d.thread || {};
+  const dot = document.getElementById('statusDot');
+  const next = d.next || [];
+  if (next.length > 0) { dot.className = 'dot yellow'; }
+  else if ((d.state||{}).stage === 'idle') { dot.className = 'dot green'; }
+  else { dot.className = 'dot green'; }
+
+  const rows = [
+    ['User', t.whatsapp_user_id || '—'],
+    ['Thread ID', t.thread_id || '—'],
+    ['Article ID', t.article_id || '<em>null</em>'],
+  ];
+  document.getElementById('threadTable').innerHTML = rows.map(([k,v]) =>
+    `<tr><td>${k}</td><td>${v}</td></tr>`
+  ).join('');
+}
+
+function renderGraph(d) {
+  const s = d.state || {};
+  const next = d.next || [];
+  const stage = s.stage || 'unknown';
+  const stageCls = stage === 'idle' ? 'idle' : 'stage';
+  const rows = [
+    ['Stage', `<span class="badge ${stageCls}">${stage}</span>`],
+    ['Paused at', next.length ? `<span class="badge paused">${next.join(', ')}</span>` : '<span style="color:#3fb950">not paused</span>'],
+    ['Intent', s.intent || '—'],
+    ['Article ID', s.article_id || '<em>not in state</em>'],
+    ['Draft Version', s.draft_version || '—'],
+    ['Hero Attempt', s.hero_attempt || '—'],
+    ['Infographic Attempt', s.infographic_attempt || '—'],
+  ];
+  document.getElementById('graphTable').innerHTML = rows.map(([k,v]) =>
+    `<tr><td>${k}</td><td>${v}</td></tr>`
+  ).join('');
+}
+
+function renderState(state) {
+  if (!state) {
+    document.getElementById('stateTable').innerHTML = '<tr><td colspan="2" class="empty">No state (checkpointer empty?)</td></tr>';
+    return;
+  }
+  const skip = new Set(['actions_log','recent_messages']);
+  const rows = Object.entries(state)
+    .filter(([k]) => !skip.has(k))
+    .sort(([a],[b]) => a.localeCompare(b))
+    .map(([k,v]) => {
+      let val = v;
+      if (v === null || v === undefined) val = '<em style="color:#8b949e">null</em>';
+      else if (typeof v === 'object') val = JSON.stringify(v);
+      else val = String(v);
+      return `<tr><td>${k}</td><td>${val}</td></tr>`;
+    });
+  document.getElementById('stateTable').innerHTML = rows.join('') || '<tr><td colspan="2" class="empty">Empty state</td></tr>';
+}
+
+function renderActions(state) {
+  const log = (state || {}).actions_log || [];
+  if (!log.length) {
+    document.getElementById('actionsLog').innerHTML = '<div class="empty">No actions yet</div>';
+    return;
+  }
+  document.getElementById('actionsLog').innerHTML = log.map(e =>
+    `<div class="log-entry"><span class="action">${e.action||'?'}</span> ${e.details||''}</div>`
+  ).join('');
+}
+
+function showError(msg) { const el = document.getElementById('error'); el.textContent = msg; el.style.display = 'block'; }
+function hideError() { document.getElementById('error').style.display = 'none'; }
+
+// Auto-refresh
+function startAuto() {
+  stopAuto();
+  if (document.getElementById('autoRefresh').checked && document.getElementById('userSelect').value) {
+    timer = setInterval(refresh, 3000);
+  }
+}
+function stopAuto() { if (timer) { clearInterval(timer); timer = null; } }
+document.getElementById('autoRefresh').onchange = () => {
+  if (document.getElementById('autoRefresh').checked) startAuto();
+  else stopAuto();
+};
+document.getElementById('userSelect').onchange = () => { refresh(); startAuto(); };
+
+loadThreads();
+</script>
+</body>
+</html>

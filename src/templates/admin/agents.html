@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin · Agents</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #f8f9fa;
+      --surface: #fff;
+      --border: #e2e4e8;
+      --text: #1a1d21;
+      --text-secondary: #5c6370;
+      --text-muted: #8b919a;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --success: #059669;
+      --radius: 6px;
+      --mono: 'IBM Plex Mono', 'SF Mono', monospace;
+      --sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    body { font-family: var(--sans); background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .layout { display: flex; flex-direction: column; min-height: 100vh; }
+    .header {
+      display: flex; align-items: center;
+      padding: 16px 24px; background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 { font-size: 15px; font-weight: 600; }
+    .nav { display: flex; gap: 20px; margin-left: 24px; font-size: 13px; }
+    .nav a { color: var(--text-secondary); }
+    .nav a.active { color: var(--text); font-weight: 500; }
+
+    .main { flex: 1; padding: 24px; max-width: 840px; }
+
+    .agent-block {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 16px;
+      overflow: hidden;
+    }
+    .agent-block.master { border-left: 3px solid var(--accent); }
+
+    .agent-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .agent-header:hover { background: #fafbfc; }
+    .agent-name { font-size: 14px; font-weight: 600; }
+    .agent-desc { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+    .agent-meta { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+    .agent-chevron { color: var(--text-muted); font-size: 10px; transition: transform .2s; }
+    .agent-block.open .agent-chevron { transform: rotate(90deg); }
+
+    .agent-body {
+      display: none;
+      padding: 0 20px 20px;
+      border-top: 1px solid var(--border);
+    }
+    .agent-block.open .agent-body { display: block; padding-top: 20px; }
+
+    .section { margin-bottom: 20px; }
+    .section:last-child { margin-bottom: 0; }
+    .section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); margin-bottom: 10px; }
+    .section-list { font-size: 12px; color: var(--text-secondary); }
+
+    .form-row { margin-bottom: 12px; }
+    .form-row label { display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+    .form-row .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .form-row select {
+      flex: 1; min-width: 140px; max-width: 200px;
+      padding: 8px 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .form-row select:focus { outline: none; border-color: var(--accent); }
+    .form-row input[type="number"] {
+      width: 80px; padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 12px;
+    }
+
+    .prompt-item { margin-bottom: 16px; }
+    .prompt-item:last-child { margin-bottom: 0; }
+    .prompt-item label { font-size: 11px; font-weight: 500; color: var(--text-muted); display: block; margin-bottom: 4px; font-family: var(--mono); }
+    .prompt-item textarea {
+      width: 100%; min-height: 160px;
+      padding: 12px 14px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.5;
+      resize: vertical;
+    }
+    .prompt-item textarea:focus { outline: none; border-color: var(--accent); }
+
+    .btn {
+      padding: 8px 16px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 13px; font-weight: 500;
+      cursor: pointer;
+    }
+    .btn:hover { background: var(--accent-hover); }
+    .btn-success { background: var(--success); }
+    .btn-success:hover { filter: brightness(1.05); }
+
+    .status-msg { padding: 10px 14px; border-radius: var(--radius); font-size: 13px; margin-top: 16px; }
+    .status-msg.success { background: #d1fae5; color: #065f46; }
+    .status-msg.error { background: #fee2e2; color: #991b1b; }
+
+    .note { font-size: 12px; color: var(--text-muted); margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <header class="header">
+      <h1>Admin</h1>
+      <nav class="nav">
+        <a href="/admin/traces">Traces</a>
+        <a href="/admin/agents" class="active">Agents</a>
+        <a href="/admin/last-deep-research">Last Research</a>
+      </nav>
+    </header>
+
+    <main class="main">
+      <p class="note">Configure each agent. Choose provider then model. Prompts are fully editable.</p>
+      <div id="agents-container"></div>
+      <div style="margin-top: 24px;">
+        <button type="button" class="btn btn-success" id="save-all-btn">Save</button>
+      </div>
+      <div id="save-status"></div>
+    </main>
+  </div>
+
+  <script>
+    const API = '/api/admin';
+    const ESC = s => (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+    let originalConfig = {};
+    let originalPrompts = {};
+
+    async function loadAgents() {
+      const r = await fetch(API + '/agents');
+      const { agents, model_to_provider } = await r.json();
+      const container = document.getElementById('agents-container');
+      container.innerHTML = '';
+
+      originalConfig = {};
+      originalPrompts = {};
+      agents.forEach(a => {
+        (a.config_keys || []).forEach(ck => { originalConfig[ck.key] = a.config[ck.key] ?? ''; });
+        (a.prompts || []).forEach(pk => { originalPrompts[pk] = a.prompt_contents[pk] ?? ''; });
+      });
+
+      agents.forEach((agent, idx) => {
+        const isMaster = agent.id === 'master_agent';
+        const block = document.createElement('div');
+        block.className = 'agent-block' + (isMaster ? ' master' : '') + ' open';
+        block.dataset.agentId = agent.id;
+
+        const providersModels = agent.providers_models || {};
+        const toolsList = (agent.tools || []).length > 0 ? (agent.tools || []).join(', ') : '—';
+        const subList = (agent.sub_agents || []).length > 0 ? (agent.sub_agents || []).join(', ') : '—';
+
+        let configHtml = '';
+        (agent.config_keys || []).forEach(ck => {
+          const val = agent.config[ck.key] || '';
+          const provider = model_to_provider[val] || Object.keys(providersModels)[0];
+          const models = providersModels[provider] || [];
+
+          if (ck.type === 'provider_model') {
+            const providerOpts = Object.keys(providersModels).map(p => `<option value="${ESC(p)}" ${p === provider ? 'selected' : ''}>${ESC(p)}</option>`).join('');
+            const modelOpts = models.map(m => `<option value="${ESC(m)}" ${m === val ? 'selected' : ''}>${ESC(m)}</option>`).join('');
+            configHtml += `
+              <div class="form-row" data-key="${ESC(ck.key)}">
+                <label>${ESC(ck.label)}</label>
+                <div class="row">
+                  <select data-role="provider" data-key="${ESC(ck.key)}">${providerOpts}</select>
+                  <select data-role="model" data-key="${ESC(ck.key)}">${modelOpts}</select>
+                </div>
+              </div>`;
+          } else if (ck.type === 'number') {
+            configHtml += `<div class="form-row"><label>${ESC(ck.label)}</label><input type="number" data-key="${ESC(ck.key)}" value="${ESC(val)}" min="${ck.min||0}" max="${ck.max||999}"></div>`;
+          }
+        });
+
+        let promptsHtml = '';
+        (agent.prompts || []).forEach(pk => {
+          promptsHtml += `
+            <div class="prompt-item">
+              <label>${ESC(pk)}</label>
+              <textarea data-prompt="${ESC(pk)}" spellcheck="false"></textarea>
+            </div>`;
+        });
+
+        block.innerHTML = `
+          <div class="agent-header">
+            <div>
+              <div class="agent-name">${ESC(agent.name)}</div>
+              ${agent.description ? `<div class="agent-desc">${ESC(agent.description)}</div>` : ''}
+              <div class="agent-meta">
+                ${(agent.tools||[]).length > 0 ? 'Tools: ' + toolsList : ''}
+                ${(agent.sub_agents||[]).length > 0 ? ' · Sub-agents: ' + subList : ''}
+              </div>
+            </div>
+            <span class="agent-chevron">▶</span>
+          </div>
+          <div class="agent-body">
+            ${(agent.tools||[]).length > 0 || (agent.sub_agents||[]).length > 0 ? `
+              <div class="section">
+                <div class="section-title">Tools & Sub-agents</div>
+                <div class="section-list">Tools: ${toolsList}</div>
+                <div class="section-list" style="margin-top:4px">Sub-agents: ${subList}</div>
+              </div>
+            ` : ''}
+            ${configHtml ? `<div class="section"><div class="section-title">Model</div>${configHtml}</div>` : ''}
+            ${promptsHtml ? `<div class="section"><div class="section-title">Prompts</div>${promptsHtml}</div>` : ''}
+          </div>
+        `;
+
+        block.querySelector('.agent-header').addEventListener('click', () => block.classList.toggle('open'));
+
+        (agent.prompts || []).forEach(pk => {
+          const ta = block.querySelector(`textarea[data-prompt="${pk}"]`);
+          if (ta) ta.value = agent.prompt_contents[pk] || '';
+        });
+
+        block.querySelectorAll('[data-role="provider"]').forEach(sel => {
+          sel.addEventListener('change', () => {
+            const key = sel.dataset.key;
+            const models = providersModels[sel.value] || [];
+            const modelSel = block.querySelector(`select[data-role="model"][data-key="${key}"]`);
+            if (modelSel) {
+              modelSel.innerHTML = models.map(m => `<option value="${ESC(m)}">${ESC(m)}</option>`).join('');
+              modelSel.value = models[0] || '';
+            }
+          });
+        });
+
+        container.appendChild(block);
+      });
+    }
+
+    document.getElementById('save-all-btn').addEventListener('click', async () => {
+      const config = {};
+      document.querySelectorAll('select[data-role="model"]').forEach(el => { config[el.dataset.key] = el.value; });
+      document.querySelectorAll('input[data-key]').forEach(el => { config[el.dataset.key] = el.value; });
+
+      const configDiff = {};
+      for (const [k, v] of Object.entries(config)) {
+        if (String(originalConfig[k] ?? '') !== String(v)) configDiff[k] = v;
+      }
+
+      const prompts = {};
+      document.querySelectorAll('textarea[data-prompt]').forEach(ta => {
+        prompts[ta.dataset.prompt] = ta.value;
+      });
+      const promptsDiff = {};
+      for (const [k, v] of Object.entries(prompts)) {
+        if ((originalPrompts[k] ?? '') !== v) promptsDiff[k] = v;
+      }
+
+      const status = document.getElementById('save-status');
+      try {
+        if (Object.keys(configDiff).length > 0) {
+          const cr = await fetch(API + '/agent-config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(configDiff) });
+          if (!cr.ok) throw new Error(await cr.text());
+          Object.assign(originalConfig, configDiff);
+        }
+        if (Object.keys(promptsDiff).length > 0) {
+          const pr = await fetch(API + '/prompts', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(promptsDiff) });
+          if (!pr.ok) throw new Error(await pr.text());
+          Object.assign(originalPrompts, promptsDiff);
+        }
+        const changed = Object.keys(configDiff).length + Object.keys(promptsDiff).length;
+        status.innerHTML = '<div class="status-msg success">' + (changed > 0 ? 'Saved.' : 'No changes.') + '</div>';
+      } catch (err) {
+        status.innerHTML = '<div class="status-msg error">' + ESC(err.message) + '</div>';
+      }
+      setTimeout(() => status.innerHTML = '', 3000);
+    });
+
+    loadAgents();
+  </script>
+</body>
+</html>
