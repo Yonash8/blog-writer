@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Image generation: placement analysis (OpenAI), Imagen/DALL-E, Gemini with references, injection, Supabase upload.
 
 Includes hero image and infographic generation with style reference support.
@@ -272,6 +273,9 @@ def analyze_infographic_placement(article_markdown: str) -> dict[str, Any]:
 
     analysis_prompt = get_prompt("infographic_analysis")
     model = get_config("infographic_analysis_model", "claude-sonnet-4-20250514")
+    if not model.startswith("claude"):
+        logger.warning("[IMAGES] infographic_analysis_model=%r is not an Anthropic model, using claude-sonnet-4-20250514", model)
+        model = "claude-sonnet-4-20250514"
 
     client = Anthropic(api_key=api_key)
     prompt = analysis_prompt.format(article=article_markdown[:15000])

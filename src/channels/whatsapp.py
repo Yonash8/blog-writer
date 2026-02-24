@@ -51,12 +51,12 @@ def send_article_single(
 def send_message_chunked(
     chat_id: str,
     message: str,
-    max_chunk: int = 800,
+    max_chunk: int = 3000,
     quoted_message_id: Optional[str] = None,
 ) -> None:
     """
-    Send message in short chunks. Splits at paragraph boundaries when possible.
-    Uses smaller chunks (800 chars) for better WhatsApp readability.
+    Send message in chunks. Splits at paragraph boundaries when possible,
+    batching consecutive short paragraphs to avoid flooding the chat.
     If quoted_message_id is provided, only the first chunk will be sent as a quoted reply.
     """
     message = format_for_whatsapp(message)
@@ -65,6 +65,21 @@ def send_message_chunked(
         return
     # Split by double newline first (paragraphs), then by single newline, then by space
     parts = re.split(r"\n\n+", message)
+    # Batch short paragraphs together so we don't flood the chat with tiny messages
+    batched: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = f"{current}\n\n{part}".strip() if current else part
+        if len(candidate) <= max_chunk:
+            current = candidate
+        else:
+            if current:
+                batched.append(current)
+            current = part
+    if current:
+        batched.append(current)
+    parts = batched
+
     chunks = []
     for part in parts:
         if len(part) <= max_chunk:

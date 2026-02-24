@@ -1,33 +1,22 @@
-"""Core pipeline: Deep research + Tavily enrichment + PromptLayer SEO agent."""
+from __future__ import annotations
+"""Core pipeline: Tavily enrichment + PromptLayer SEO agent."""
 
 import json
 import logging
 import os
 import time
 from contextvars import ContextVar
-from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 import httpx
 from dotenv import load_dotenv
-from openai import OpenAI
 from tavily import TavilyClient
 
-from src.config import get_config
 from src.observability import observe_sub_agent
-from src.prompts_loader import get_prompt
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-# In-memory cache of last deep research (available even when file save is disabled)
-_last_deep_research: dict[str, Any] = {"topic": "", "content": "", "at": None}
-
-
-def get_last_deep_research() -> dict[str, Any]:
-    """Return the most recent deep research (topic, content, timestamp). Empty if none run yet."""
-    return dict(_last_deep_research)
 
 # Status callback for progress updates (set by run_agent before invoking tools)
 status_callback: ContextVar[Optional[Callable[[str], None]]] = ContextVar(
@@ -62,207 +51,6 @@ def emit_status(text: str) -> None:
         except Exception as e:
             logger.warning("Status callback error: %s", e)
 
-
-def _run_deep_research_perplexity(topic: str, model: str = "sonar-pro") -> str:
-    """Perplexity Sonar for deep research."""
-    api_key = os.getenv("PERPLEXITY_API_KEY")
-    if not api_key:
-        raise ValueError("PERPLEXITY_API_KEY not set")
-    prompt = get_prompt("deep_research").format(topic=topic)
-    prompt += "\n\nIMPORTANT: Produce a thorough report of at least 2500-4000 words. Include detailed sections with multiple paragraphs each. Be exhaustive—cover every relevant angle. Do not summarize briefly."
-    emit_status("Using Perplexity for research...")
-    models_to_try = [model] if model in ("sonar-pro", "sonar") else ["sonar-pro", "sonar"]
-    for try_model in models_to_try:
-        check_cancelled()  # Bail out if user requested cancellation
-        logger.info("[PIPELINE] Deep research: using Perplexity %s", try_model)
-        try:
-            # Cranked params for robust research: high max_tokens, return_citations, wide recency
-            payload = {
-                "model": try_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 32768 if try_model == "sonar-pro" else 16384,
-                "temperature": 0.1,
-                "return_citations": True,
-                "return_related_questions": True,
-                "search_recency_filter": "year",
-            }
-            if try_model == "sonar-pro":
-                payload["web_search_options"] = {"search_context_size": "high"}
-            with httpx.Client() as client:
-                response = client.post(
-                    "https://api.perplexity.ai/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=300.0,
-                )
-                response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                logger.info("[PIPELINE] Perplexity %s DONE: output_len=%d chars", try_model, len(content))
-                return content
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code in (400, 402, 404) and try_model == "sonar-pro":
-                logger.warning("[PIPELINE] sonar-pro failed (%s), trying sonar", e)
-                continue
-            raise
-    raise RuntimeError("Perplexity fallback failed")
-
-
-def run_deep_research(topic: str, max_tool_calls: int = 50) -> str:
-    """Run deep research on the topic. Uses configured model (o3-deep-research, sonar-pro, sonar)."""
-    model = get_config("deep_research_model", "o3-deep-research")
-    logger.info("[PIPELINE] Deep research: topic=%r, model=%s", topic, model)
-    start = time.perf_counter()
-
-    if model in ("sonar-pro", "sonar"):
-        result = _run_deep_research_perplexity(topic, model=model)
-        latency_ms = (time.perf_counter() - start) * 1000
-        observe_sub_agent(name="deep_research", input_keys=["topic"], output_size=len(result), latency_ms=latency_ms, status="success", provider="perplexity")
-        _last_deep_research.update({"topic": topic, "content": result, "at": datetime.now(timezone.utc).isoformat()})
-        return result
-
-    try:
-        result = _run_deep_research_openai(topic, max_tool_calls)
-        latency_ms = (time.perf_counter() - start) * 1000
-        observe_sub_agent(name="deep_research", input_keys=["topic"], output_size=len(result), latency_ms=latency_ms, status="success", provider="openai")
-        _last_deep_research.update({"topic": topic, "content": result, "at": datetime.now(timezone.utc).isoformat()})
-        return result
-    except Exception as e:
-        if os.getenv("PERPLEXITY_API_KEY"):
-            logger.warning("[PIPELINE] OpenAI deep research failed (%s), falling back to Perplexity", e)
-            result = _run_deep_research_perplexity(topic)
-            latency_ms = (time.perf_counter() - start) * 1000
-            observe_sub_agent(name="deep_research", input_keys=["topic"], output_size=len(result), latency_ms=latency_ms, status="success", provider="perplexity")
-            _last_deep_research.update({"topic": topic, "content": result, "at": datetime.now(timezone.utc).isoformat()})
-            return result
-        latency_ms = (time.perf_counter() - start) * 1000
-        observe_sub_agent(name="deep_research", input_keys=["topic"], output_size=0, latency_ms=latency_ms, status="failure", provider="openai")
-        raise
-
-
-def _run_deep_research_openai(topic: str, max_tool_calls: int) -> str:
-    """OpenAI o3-deep-research via Responses API (background mode with polling)."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.error("[PIPELINE] OPENAI_API_KEY not set")
-        raise ValueError("OPENAI_API_KEY not set")
-
-    client = OpenAI(api_key=api_key, timeout=3600)
-    prompt = get_prompt("deep_research").format(topic=topic)
-    logger.info("[PIPELINE] Deep research: calling o3-deep-research (background=True)")
-    emit_status("Running deep research via o3...")
-
-    response = client.responses.create(
-        model="o3-deep-research",
-        input=prompt,
-        tools=[{"type": "web_search_preview"}],
-        background=True,
-        max_tool_calls=max_tool_calls,
-    )
-    logger.info(
-        "[PIPELINE] Deep research created: id=%s, status=%s, created_at=%s, model=%s, max_tool_calls=%d",
-        response.id, getattr(response, "status", "n/a"), getattr(response, "created_at", "n/a"),
-        getattr(response, "model", "n/a"), max_tool_calls,
-    )
-
-    # Poll until the background task completes; emit progress every 4 min
-    poll_start = time.monotonic()
-    last_emit_min = 0
-    poll_count = 0
-    include_meta = ["web_search_call.results", "web_search_call.action.sources"]
-    while response.status in ("queued", "in_progress"):
-        check_cancelled()  # Bail out if user requested cancellation
-        poll_count += 1
-        elapsed = int(time.monotonic() - poll_start)
-        # Extract all available metadata for logging
-        output_items = getattr(response, "output", []) or []
-        web_search_count = sum(1 for o in output_items if getattr(o, "type", None) == "web_search_call")
-        message_count = sum(1 for o in output_items if getattr(o, "type", None) == "message")
-        created_at = getattr(response, "created_at", None)
-        model = getattr(response, "model", None)
-        usage = getattr(response, "usage", None)
-        usage_str = ""
-        if usage is not None:
-            inp = getattr(usage, "input_tokens", None)
-            out = getattr(usage, "output_tokens", None)
-            total = getattr(usage, "total_tokens", None)
-            if inp is not None or out is not None or total is not None:
-                usage_str = ", usage=%d in/%d out/%d total" % (inp or 0, out or 0, total or 0)
-        logger.info(
-            "[PIPELINE] Deep research polling #%d: status=%s, id=%s, elapsed=%ds, model=%s, created_at=%s, output_items=%d (web_search=%d, message=%d)%s",
-            poll_count, response.status, response.id, elapsed, model, created_at,
-            len(output_items), web_search_count, message_count, usage_str,
-        )
-        elapsed_min = int((time.monotonic() - poll_start) / 60)
-        if elapsed_min > 0 and elapsed_min % 4 == 0 and elapsed_min != last_emit_min:
-            last_emit_min = elapsed_min
-            emit_status(f"Deep research still in progress ({elapsed_min} min)...")
-        time.sleep(15)
-        response = client.responses.retrieve(response.id, include=include_meta)
-
-    if response.status != "completed":
-        # Extract error details from the API response
-        error_detail = "no error field"
-        err = getattr(response, "error", None)
-        if err is not None:
-            if hasattr(err, "message"):
-                error_detail = err.message
-            elif hasattr(err, "code"):
-                error_detail = f"code={err.code}, message={getattr(err, 'message', '')}"
-            elif isinstance(err, dict):
-                error_detail = str(err)
-            else:
-                error_detail = str(err)
-        incomplete = getattr(response, "incomplete_details", None)
-        if incomplete is not None:
-            reason = getattr(incomplete, "reason", None) or (incomplete.get("reason") if isinstance(incomplete, dict) else None)
-            if reason:
-                error_detail = f"{error_detail}; incomplete_details.reason={reason}"
-        logger.error(
-            "[PIPELINE] Deep research FAILED: status=%s, id=%s, error=%s",
-            response.status,
-            response.id,
-            error_detail,
-        )
-        raise RuntimeError(
-            f"Deep research failed with status '{response.status}' (id={response.id}): {error_detail}"
-        )
-
-    research_len = len(response.output_text) if response.output_text else 0
-    # Save last deep research to file for inspection (path from env or default)
-    save_path = os.getenv("DEEP_RESEARCH_SAVE_PATH", "last_deep_research.md")
-    if save_path and response.output_text:
-        try:
-            abs_path = os.path.abspath(save_path)
-            with open(abs_path, "w", encoding="utf-8") as f:
-                f.write(response.output_text)
-            logger.info("[PIPELINE] Deep research saved to %s", abs_path)
-        except OSError as e:
-            logger.warning("[PIPELINE] Could not save deep research to %s: %s", save_path, e)
-    # Log all completion metadata
-    output_items = getattr(response, "output", []) or []
-    web_search_count = sum(1 for o in output_items if getattr(o, "type", None) == "web_search_call")
-    message_count = sum(1 for o in output_items if getattr(o, "type", None) == "message")
-    usage = getattr(response, "usage", None)
-    usage_log = ""
-    if usage is not None:
-        inp = getattr(usage, "input_tokens", None)
-        out = getattr(usage, "output_tokens", None)
-        total = getattr(usage, "total_tokens", None)
-        cached = getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", None)
-        reasoning = getattr(getattr(usage, "output_tokens_details", None), "reasoning_tokens", None)
-        usage_log = ", usage: input=%d, output=%d, total=%d, cached=%s, reasoning=%s" % (
-            inp or 0, out or 0, total or 0, cached if cached is not None else "n/a", reasoning if reasoning is not None else "n/a"
-        )
-    logger.info(
-        "[PIPELINE] Deep research DONE: id=%s, output_len=%d chars, output_items=%d (web_search=%d, message=%d), created_at=%s, model=%s%s",
-        response.id, research_len, len(output_items), web_search_count, message_count,
-        getattr(response, "created_at", "n/a"), getattr(response, "model", "n/a"), usage_log,
-    )
-    return response.output_text
 
 
 def run_tavily_enrichment(topic: str, max_results: int = 20) -> list[dict[str, Any]]:
@@ -439,13 +227,21 @@ def _truncate_for_log(obj: Any, max_str: int = 400) -> str:
         return str(obj)[:500]
 
 
-def run_promptlayer_agent(topic: str, research: str) -> str:
-    """Invoke PromptLayer SEO agent with topic and research. Auto-retries with chunked research on token overflow."""
+def run_promptlayer_agent(topic: str, research: str) -> dict[str, Any]:
+    """Invoke PromptLayer SEO agent with topic and research.
+
+    Returns {"article": str, "metadata": Any}.
+    Article comes from the "add links from research" node (PROMPTLAYER_ARTICLE_NODE).
+    Metadata comes from the "metadata agent" node (PROMPTLAYER_METADATA_NODE).
+    Auto-retries with chunked research on token overflow.
+    """
     logger.info("[PIPELINE] PromptLayer: topic=%r, research_len=%d chars", topic, len(research))
     emit_status("Writing article with PromptLayer...")
     start = time.perf_counter()
     api_key = os.getenv("PROMPTLAYER_API_KEY")
     workflow_name = os.getenv("PROMPTLAYER_WORKFLOW_NAME", "seo agent")
+    article_node_name = os.getenv("PROMPTLAYER_ARTICLE_NODE", "add links from research")
+    metadata_node_name = os.getenv("PROMPTLAYER_METADATA_NODE", "metadata agent")
     if not api_key:
         logger.error("[PIPELINE] PROMPTLAYER_API_KEY not set")
         raise ValueError("PROMPTLAYER_API_KEY not set")
@@ -511,6 +307,9 @@ def run_promptlayer_agent(topic: str, research: str) -> str:
                     if results_response.status_code == 202:
                         if poll_i % 5 == 0:
                             logger.info("[PIPELINE] PromptLayer: poll #%d still running (202)", poll_i + 1)
+                        elapsed_min = (poll_i + 1) * 15 // 60
+                        if poll_i > 0 and poll_i % 4 == 0:
+                            emit_status(f"Still writing... ({elapsed_min}m)")
                         time.sleep(15)
                         continue
                     if results_response.status_code != 200:
@@ -531,12 +330,6 @@ def run_promptlayer_agent(topic: str, research: str) -> str:
                                 logger.error("[PIPELINE] PromptLayer node %r FAILED: %s", node_name, err_msg)
                                 raise RuntimeError(f"PromptLayer node {node_name!r} failed: {err_msg}")
 
-                    # Response is keyed by node name. We need the ARTICLE, not research.
-                    # - Prefer nodes with is_output_node=True (official workflow output)
-                    # - Exclude "Research Agent" - it outputs research, not the final article
-                    RESEARCH_NODE_NAMES = {"Research Agent", "research agent"}  # blocklist
-                    output_node_name = os.getenv("PROMPTLAYER_OUTPUT_NODE")  # e.g. "Write Article"
-
                     def _extract_val(nd: dict) -> str | None:
                         v = nd.get("value")
                         if v is not None and isinstance(v, str) and len(v) > 100:
@@ -546,99 +339,56 @@ def run_promptlayer_agent(topic: str, research: str) -> str:
                             return s if len(s) > 100 else None
                         return None
 
-                    # 1) Use explicitly configured output node if set
-                    if output_node_name and output_node_name in results_data:
-                        nd = results_data.get(output_node_name)
-                        if isinstance(nd, dict) and nd.get("status", "SUCCESS").upper() == "SUCCESS":
-                            out = _extract_val(nd)
-                            if out:
-                                latency_ms = (time.perf_counter() - start) * 1000
-                                observe_sub_agent(
-                                    name="promptlayer_seo",
-                                    input_keys=["topic", "research"],
-                                    output_size=len(out),
-                                    latency_ms=latency_ms,
-                                    status="success",
-                                    provider="promptlayer",
-                                )
-                                logger.info("[PIPELINE] PromptLayer DONE: node=%r (configured) len=%d", output_node_name, len(out))
-                                return out
-                    # 2) Prefer nodes marked as output node (is_output_node=True)
-                    for node_name, node_data in results_data.items():
-                        if node_name in RESEARCH_NODE_NAMES or not isinstance(node_data, dict):
-                            continue
-                        if not node_data.get("is_output_node"):
-                            continue
-                        if node_data.get("status", "SUCCESS").upper() != "SUCCESS":
-                            continue
-                        out = _extract_val(node_data)
-                        if out:
-                            latency_ms = (time.perf_counter() - start) * 1000
-                            observe_sub_agent(
-                                name="promptlayer_seo",
-                                input_keys=["topic", "research"],
-                                output_size=len(out),
-                                latency_ms=latency_ms,
-                                status="success",
-                                provider="promptlayer",
-                            )
-                            logger.info("[PIPELINE] PromptLayer DONE: node=%r (is_output_node) len=%d", node_name, len(out))
-                            return out
-                    # 3) Fallback: any non-research node with long output
-                    for node_name, node_data in results_data.items():
-                        if node_name in RESEARCH_NODE_NAMES:
-                            continue
-                        if not isinstance(node_data, dict):
-                            continue
-                        if node_data.get("status", "SUCCESS").upper() != "SUCCESS":
-                            continue
-                        out = _extract_val(node_data)
-                        if out:
-                            latency_ms = (time.perf_counter() - start) * 1000
-                            observe_sub_agent(
-                                name="promptlayer_seo",
-                                input_keys=["topic", "research"],
-                                output_size=len(out),
-                                latency_ms=latency_ms,
-                                status="success",
-                                provider="promptlayer",
-                            )
-                            logger.info("[PIPELINE] PromptLayer DONE: node=%r len=%d", node_name, len(out))
-                            return out
-                    if isinstance(results_data, dict) and "final_output" in results_data:
-                        fo = results_data["final_output"]
-                        if isinstance(fo, str):
-                            latency_ms = (time.perf_counter() - start) * 1000
-                            observe_sub_agent(
-                                name="promptlayer_seo",
-                                input_keys=["topic", "research"],
-                                output_size=len(fo),
-                                latency_ms=latency_ms,
-                                status="success",
-                                provider="promptlayer",
-                            )
-                            return fo
-                        if isinstance(fo, dict):
-                            for k, v in fo.items():
-                                if k in RESEARCH_NODE_NAMES:
-                                    continue
-                                if isinstance(v, dict):
-                                    st = (v.get("status") or "SUCCESS").upper()
-                                    if st != "SUCCESS":
-                                        continue
-                                    if "value" in v:
-                                        out = str(v["value"])
-                                        if len(out) > 100:
-                                            latency_ms = (time.perf_counter() - start) * 1000
-                                            observe_sub_agent(
-                                                name="promptlayer_seo",
-                                                input_keys=["topic", "research"],
-                                                output_size=len(out),
-                                                latency_ms=latency_ms,
-                                                status="success",
-                                                provider="promptlayer",
-                                            )
-                                            return out
+                    def _extract_metadata(nd: dict) -> Any:
+                        """Extract metadata node value as-is (dict, str, or None)."""
+                        v = nd.get("value")
+                        if isinstance(v, dict) and "value" in v:
+                            return v["value"]
+                        return v
+
+                    # --- Extract article from named node ---
+                    article_out: str | None = None
+                    metadata_out: Any = None
+
+                    article_nd = results_data.get(article_node_name)
+                    if isinstance(article_nd, dict) and article_nd.get("status", "SUCCESS").upper() == "SUCCESS":
+                        article_out = _extract_val(article_nd)
+                        if article_out:
+                            logger.info("[PIPELINE] PromptLayer: article from node %r, len=%d", article_node_name, len(article_out))
+
+                    # --- Extract metadata from named node ---
+                    metadata_nd = results_data.get(metadata_node_name)
+                    if isinstance(metadata_nd, dict) and metadata_nd.get("status", "SUCCESS").upper() == "SUCCESS":
+                        metadata_out = _extract_metadata(metadata_nd)
+                        logger.info("[PIPELINE] PromptLayer: metadata from node %r", metadata_node_name)
+
+                    # --- Fallback: any is_output_node if article not found yet ---
+                    if not article_out:
+                        SKIP_NODES = {article_node_name, metadata_node_name, "Research Agent", "research agent"}
+                        for node_name, node_data in results_data.items():
+                            if node_name in SKIP_NODES or not isinstance(node_data, dict):
+                                continue
+                            if not node_data.get("is_output_node"):
+                                continue
+                            if node_data.get("status", "SUCCESS").upper() != "SUCCESS":
+                                continue
+                            article_out = _extract_val(node_data)
+                            if article_out:
+                                logger.info("[PIPELINE] PromptLayer: article fallback from is_output_node %r, len=%d", node_name, len(article_out))
+                                break
+
+                    if article_out:
+                        latency_ms = (time.perf_counter() - start) * 1000
+                        observe_sub_agent(
+                            name="promptlayer_seo",
+                            input_keys=["topic", "research"],
+                            output_size=len(article_out),
+                            latency_ms=latency_ms,
+                            status="success",
+                            provider="promptlayer",
+                        )
+                        return {"article": article_out, "metadata": metadata_out}
+
                     time.sleep(15)
 
             latency_ms = (time.perf_counter() - start) * 1000
@@ -650,7 +400,7 @@ def run_promptlayer_agent(topic: str, research: str) -> str:
                 status="failure",
                 provider="promptlayer",
             )
-            logger.error("[PIPELINE] PromptLayer: timed out after 90 polls")
+            logger.error("[PIPELINE] PromptLayer: timed out after 90 polls (article_node=%r, metadata_node=%r)", article_node_name, metadata_node_name)
             raise RuntimeError("PromptLayer execution timed out or returned no output")
         except RuntimeError as e:
             err_str = str(e)
@@ -668,34 +418,242 @@ def run_promptlayer_agent(topic: str, research: str) -> str:
             raise
 
 
-def write_article_from_research(topic: str, research: str) -> str:
+def run_metadata_agent(article_content: str) -> Any:
+    """Call PromptLayer metadata workflow with the approved article content.
+
+    Returns the raw metadata output (dict, str, etc.) from the workflow.
+    Uses PROMPTLAYER_METADATA_WORKFLOW env (default "metadata agent").
     """
-    Run only PromptLayer SEO agent with given research (no deep research, no Tavily).
+    logger.info("[PIPELINE] Metadata agent: content_len=%d chars", len(article_content))
+    emit_status("Generating SEO metadata...")
+    start = time.perf_counter()
+    api_key = os.getenv("PROMPTLAYER_API_KEY")
+    workflow_name = os.getenv("PROMPTLAYER_METADATA_WORKFLOW", "metadata agent")
+    if not api_key:
+        raise ValueError("PROMPTLAYER_API_KEY not set")
+
+    with httpx.Client() as client:
+        r = client.post(
+            f"https://api.promptlayer.com/workflows/{workflow_name.replace(' ', '%20')}/run",
+            headers={"Content-Type": "application/json", "X-API-KEY": api_key},
+            json={
+                "input_variables": {"article": article_content},
+                "return_all_outputs": True,
+            },
+            timeout=300.0,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("success"):
+            raise RuntimeError(f"PromptLayer metadata run failed: {data.get('message', 'Unknown error')}")
+
+        exec_id = data.get("workflow_version_execution_id")
+        if not exec_id:
+            raise RuntimeError("No workflow_version_execution_id in metadata response")
+
+        logger.info("[PIPELINE] Metadata agent: exec_id=%s, polling...", exec_id)
+        for poll_i in range(60):  # up to ~15 min
+            check_cancelled()
+            res = client.get(
+                "https://api.promptlayer.com/workflow-version-execution-results",
+                headers={"X-API-KEY": api_key},
+                params={"workflow_version_execution_id": exec_id, "return_all_outputs": True},
+                timeout=30.0,
+            )
+            if res.status_code == 202:
+                if poll_i > 0 and poll_i % 4 == 0:
+                    elapsed_min = (poll_i + 1) * 15 // 60
+                    emit_status(f"Generating metadata... ({elapsed_min}m)")
+                time.sleep(15)
+                continue
+            if res.status_code != 200:
+                raise RuntimeError(f"Metadata agent results failed: {res.text}")
+
+            results = res.json()
+            logger.info("[PIPELINE] Metadata agent RESULTS: %s", _truncate_for_log(results))
+
+            # Check for failures first
+            for node_name, node_data in list(results.items()):
+                if isinstance(node_data, dict):
+                    status = node_data.get("status", "").upper()
+                    if status in ("FAILURE", "FAILED"):
+                        err = node_data.get("error_message") or node_data.get("raw_error_message")
+                        err_msg = err.get("raw", err) if isinstance(err, dict) else err
+                        raise RuntimeError(f"Metadata agent node {node_name!r} failed: {err_msg}")
+
+            # Extract output node value — prefer is_output_node: true, then fall back
+            def _emit_and_return(node_name, v):
+                if isinstance(v, dict) and "value" in v:
+                    v = v["value"]
+                latency_ms = (time.perf_counter() - start) * 1000
+                observe_sub_agent(
+                    name="promptlayer_metadata",
+                    input_keys=["article"],
+                    output_size=len(str(v)),
+                    latency_ms=latency_ms,
+                    status="success",
+                    provider="promptlayer",
+                )
+                logger.info("[PIPELINE] Metadata agent DONE: node=%r, type=%s", node_name, type(v).__name__)
+                return v, exec_id
+
+            # First pass: prefer the designated output node
+            for node_name, node_data in results.items():
+                if not isinstance(node_data, dict):
+                    continue
+                if node_data.get("status", "").upper() != "SUCCESS":
+                    continue
+                if not node_data.get("is_output_node"):
+                    continue
+                v = node_data.get("value")
+                if v is not None:
+                    return _emit_and_return(node_name, v)
+
+            # Second pass: fallback to first node with any value
+            for node_name, node_data in results.items():
+                if not isinstance(node_data, dict):
+                    continue
+                if node_data.get("status", "").upper() != "SUCCESS":
+                    continue
+                v = node_data.get("value")
+                if v is not None:
+                    return _emit_and_return(node_name, v)
+
+            time.sleep(15)
+
+    latency_ms = (time.perf_counter() - start) * 1000
+    observe_sub_agent(
+        name="promptlayer_metadata",
+        input_keys=["article"],
+        output_size=0,
+        latency_ms=latency_ms,
+        status="failure",
+        provider="promptlayer",
+    )
+    raise RuntimeError("Metadata agent timed out or returned no output")
+
+
+def run_orchestrator_workflow(input_variables: Optional[dict] = None) -> str:
+    """Run the PromptLayer orchestrator workflow to get the master system prompt.
+
+    Workflow name is configured via PROMPTLAYER_ORCHESTRATOR_WORKFLOW env
+    (default: 'master_system_core').
+    Returns the workflow output as a string.
+    """
+    api_key = os.getenv("PROMPTLAYER_API_KEY")
+    workflow_name = os.getenv("PROMPTLAYER_ORCHESTRATOR_WORKFLOW", "blog_writer_master_system_core")
+    if not api_key:
+        raise ValueError("PROMPTLAYER_API_KEY not set")
+
+    logger.info("[PIPELINE] Orchestrator workflow: name=%r", workflow_name)
+    start = time.perf_counter()
+
+    with httpx.Client() as client:
+        r = client.post(
+            f"https://api.promptlayer.com/workflows/{workflow_name.replace(' ', '%20')}/run",
+            headers={"Content-Type": "application/json", "X-API-KEY": api_key},
+            json={"input_variables": input_variables or {}, "return_all_outputs": True},
+            timeout=60.0,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        if not data.get("success"):
+            raise RuntimeError(f"PromptLayer orchestrator run failed: {data.get('message', 'Unknown')}")
+
+        exec_id = data.get("workflow_version_execution_id")
+        if not exec_id:
+            raise RuntimeError("No workflow_version_execution_id in orchestrator response")
+
+        logger.info("[PIPELINE] Orchestrator workflow: exec_id=%s, polling...", exec_id)
+        for poll_i in range(20):  # up to ~100 seconds
+            time.sleep(5)
+            res = client.get(
+                "https://api.promptlayer.com/workflow-version-execution-results",
+                headers={"X-API-KEY": api_key},
+                params={"workflow_version_execution_id": exec_id, "return_all_outputs": True},
+                timeout=30.0,
+            )
+            if res.status_code == 202:
+                logger.info("[PIPELINE] Orchestrator workflow: poll #%d still running", poll_i + 1)
+                continue
+            if res.status_code != 200:
+                raise RuntimeError(f"Orchestrator workflow results failed: {res.text}")
+
+            results = res.json()
+            logger.info("[PIPELINE] Orchestrator workflow RESULTS: %s", _truncate_for_log(results))
+
+            # Check for node failures first
+            for node_name, node_data in list(results.items()):
+                if isinstance(node_data, dict):
+                    status = node_data.get("status", "").upper()
+                    if status in ("FAILURE", "FAILED"):
+                        err = node_data.get("error_message") or node_data.get("raw_error_message")
+                        err_msg = err.get("raw", err) if isinstance(err, dict) else err
+                        raise RuntimeError(f"Orchestrator workflow node {node_name!r} failed: {err_msg}")
+
+            # Extract output: prefer is_output_node, then fallback to any node with a string value
+            def _get_str(nd: dict) -> Optional[str]:
+                v = nd.get("value")
+                if isinstance(v, dict) and "value" in v:
+                    v = v["value"]
+                return v if isinstance(v, str) and len(v) > 10 else None
+
+            for node_name, node_data in results.items():
+                if not isinstance(node_data, dict):
+                    continue
+                if node_data.get("status", "").upper() != "SUCCESS":
+                    continue
+                if not node_data.get("is_output_node"):
+                    continue
+                v = _get_str(node_data)
+                if v:
+                    latency_ms = (time.perf_counter() - start) * 1000
+                    logger.info("[PIPELINE] Orchestrator workflow DONE: node=%r, len=%d, latency=%.0fms", node_name, len(v), latency_ms)
+                    return v
+
+            # Fallback: first successful node with a non-trivial string
+            for node_name, node_data in results.items():
+                if not isinstance(node_data, dict):
+                    continue
+                if node_data.get("status", "").upper() != "SUCCESS":
+                    continue
+                v = _get_str(node_data)
+                if v:
+                    latency_ms = (time.perf_counter() - start) * 1000
+                    logger.info("[PIPELINE] Orchestrator workflow DONE (fallback): node=%r, len=%d", node_name, len(v))
+                    return v
+
+    raise RuntimeError("Orchestrator workflow timed out or returned no output")
+
+
+def write_article_from_research(topic: str, research: str) -> dict[str, Any]:
+    """
+    Run only PromptLayer SEO agent with given research (no Tavily).
     Use when you have existing content (e.g. a draft to rewrite) as the research input.
-    Returns Markdown article.
+    Returns {"article": str, "metadata": Any}.
     """
     logger.info("[PIPELINE] write_article_from_research: topic=%r, research_len=%d", topic, len(research))
     return run_promptlayer_agent(topic, research)
 
 
-def write_article(topic: str, include_tavily: bool = True, tavily_max_results: int = 20) -> str:
+def write_article(topic: str, include_tavily: bool = False, tavily_max_results: int = 20) -> dict[str, Any]:
     """
-    Full pipeline: Deep research + Tavily enrichment + PromptLayer SEO agent.
-    Returns Markdown article.
+    Pipeline: optional Tavily enrichment + PromptLayer SEO agent (research is done inside PL).
+    Returns {"article": str, "metadata": Any}.
     """
     logger.info("[PIPELINE] write_article START: topic=%r, include_tavily=%s, tavily_max_results=%d", topic, include_tavily, tavily_max_results)
-    research = run_deep_research(topic)
-    logger.info("[PIPELINE] Step 1/3 (deep research) complete, research_len=%d", len(research))
 
     if include_tavily:
         tavily_results = run_tavily_enrichment(topic, max_results=tavily_max_results)
         tavily_text = format_tavily_for_research(tavily_results)
-        combined_research = f"{research}\n\n## Additional Sources (Tavily Enrichment)\n\n{tavily_text}"
-        logger.info("[PIPELINE] Step 2/3 (Tavily) complete, sources=%d, combined_len=%d", tavily_max_results, len(combined_research))
+        research = f"## Sources (Tavily Enrichment)\n\n{tavily_text}"
+        logger.info("[PIPELINE] Tavily complete, sources=%d, research_len=%d", len(tavily_results), len(research))
     else:
-        combined_research = research
-        logger.info("[PIPELINE] Step 2/3 (Tavily) skipped")
+        research = ""
+        logger.info("[PIPELINE] Tavily skipped")
 
-    article = run_promptlayer_agent(topic, combined_research)
+    result = run_promptlayer_agent(topic, research)
+    article = result.get("article", "")
     logger.info("[PIPELINE] write_article DONE: article_len=%d chars", len(article))
-    return article
+    return result

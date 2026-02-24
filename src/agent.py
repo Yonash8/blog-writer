@@ -1,16 +1,25 @@
-"""Master agent: autonomous agent with tool calling. Uses Anthropic Claude Sonnet by default."""
+from __future__ import annotations
+"""Master agent: autonomous agent with tool calling. Uses Claude Opus by default."""
 
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from anthropic import Anthropic
 
+try:
+    from promptlayer import PromptLayer as _PromptLayer
+    _pl = _PromptLayer(api_key=os.getenv("PROMPTLAYER_API_KEY", ""))
+    _AnthropicClient = _pl.anthropic.Anthropic
+except Exception:
+    _AnthropicClient = Anthropic
+
 from src.config import get_config, get_config_int
-from src.prompts_loader import get_master_system_prompt, get_prompt
+from src.prompts_loader import get_prompt, get_master_system_prompt
 from src.observability import (
     get_trace_id,
     init_trace_payload,
@@ -168,15 +177,15 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "write_article",
             "description": (
-                "Full article pipeline: deep research + Tavily enrichment + PromptLayer SEO writer. "
-                "Auto-saves to DB and creates Google Doc. Returns article_id, content, google_doc_url. "
-                "Use tavily_max_results 5-10 for quick drafts, 20 for thorough research."
+                "Full article pipeline: PromptLayer SEO writer (research is handled inside PromptLayer). "
+                "Optionally enriches with Tavily web sources — ASK the user first before setting include_tavily=True. "
+                "Auto-saves to DB and creates Google Doc. Returns article_id, content, google_doc_url, metadata."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string", "description": "The topic to write about"},
-                    "include_tavily": {"type": "boolean", "description": "Include Tavily enrichment (default True)", "default": True},
+                    "include_tavily": {"type": "boolean", "description": "Include Tavily web source enrichment (default False). Ask the user first.", "default": False},
                     "tavily_max_results": {"type": "integer", "description": "Max Tavily sources (5-20)", "default": 20},
                     "changelog_entry": {"type": "string", "description": "Brief changelog entry, e.g. 'Created draft on topic X'"},
                 },
@@ -211,6 +220,46 @@ TOOL_DEFINITIONS = [
                     "changelog_entry": {"type": "string", "description": "Brief changelog entry, e.g. 'Rephrased intro'"},
                 },
                 "required": ["article_id", "feedback"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inject_links",
+            "description": (
+                "Surgically inject hyperlinks into an article without rewriting its prose. "
+                "Fetches the latest content from Google Docs (source of truth — humans may have edited it). "
+                "Claude picks the best anchor phrase for each URL from the existing text; "
+                "links are applied directly via the Google Docs API (no doc rewrite). "
+                "Use for citations, references, and internal links. "
+                "Prefer this over improve_article when the only change is adding links."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "article_id": {"type": "string", "description": "Article UUID (resolve from CURRENT CONTEXT)"},
+                    "links": {
+                        "type": "array",
+                        "description": "URLs to inject as hyperlinks. Up to 10.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string", "description": "URL to inject"},
+                                "anchor_hint": {
+                                    "type": "string",
+                                    "description": "Suggested anchor text phrase (optional). Claude will find it in the article.",
+                                },
+                                "context_hint": {
+                                    "type": "string",
+                                    "description": "Which section or topic this link belongs to (optional).",
+                                },
+                            },
+                            "required": ["url"],
+                        },
+                    },
+                },
+                "required": ["article_id", "links"],
             },
         },
     },
@@ -318,6 +367,91 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_seo_metadata",
+            "description": (
+                "Call the PromptLayer metadata agent on the current article content and store the result in the DB. "
+                "Use this AFTER the user has approved the article (before finishing). "
+                "Returns SEO metadata (title, description, slug, tags, etc.) and saves it to the article record."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "article_id": {"type": "string", "description": "Article UUID (resolve from CURRENT CONTEXT)"},
+                },
+                "required": ["article_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "push_to_ghost",
+            "description": (
+                "Push the approved article to Ghost CMS as a draft. "
+                "Automatically runs the metadata agent if SEO metadata is not yet generated. "
+                "Strips the hero image from the inline content and sets it as Ghost's feature image. "
+                "Always creates a draft (never publishes). "
+                "Returns the Ghost editor URL so the user can review and publish manually."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "article_id": {"type": "string", "description": "Article UUID to push to Ghost (resolve from CURRENT CONTEXT)"},
+                },
+                "required": ["article_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_promptlayer_execution",
+            "description": (
+                "Fetch PromptLayer workflow execution results. Three modes:\n"
+                "1. execution_id — fetch a specific execution by its ID directly from PromptLayer.\n"
+                "2. article_id — look up the stored execution ID from that article's seo_metadata and fetch it.\n"
+                "3. last_n — return the last N articles that have stored SEO metadata (with their exec IDs and metadata), served from our DB. Use this for 'show me the last 5 runs'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "execution_id": {"type": "string", "description": "PromptLayer workflow_version_execution_id to fetch directly"},
+                    "article_id": {"type": "string", "description": "Article UUID — fetches the execution linked to this article's seo_metadata"},
+                    "last_n": {"type": "integer", "description": "Return the last N articles with stored metadata from our DB (max 20)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_history",
+            "description": (
+                "Fetch older conversation messages beyond the current context window. "
+                "Use when the user refers to something not visible in recent context "
+                "(e.g. 'that article from last week', 'what did I say earlier'). "
+                "Returns messages in chronological order."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "before_timestamp": {
+                        "type": "string",
+                        "description": "ISO timestamp — fetch messages older than this. Use the created_at of the oldest message currently in context.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max messages to return (default 20, max 50)",
+                        "default": 20,
+                    },
+                },
+                "required": ["before_timestamp"],
+            },
+        },
+    },
 ]
 
 
@@ -353,11 +487,16 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         send_image_tool as _send_image,
         write_article as _write_article,
         improve_article as _improve_article,
+        inject_links as _inject_links,
         generate_and_place_images as _generate_images,
         generate_hero_image_tool as _generate_hero_image,
         approve_hero_image_tool as _approve_hero_image,
         generate_infographic_tool as _generate_infographic,
         approve_infographic_tool as _approve_infographic,
+        generate_seo_metadata as _generate_seo_metadata,
+        push_to_ghost as _push_to_ghost,
+        fetch_promptlayer_execution as _fetch_pl_execution,
+        fetch_history as _fetch_history,
     )
 
     # Guard: log a warning for expensive operations so we have an audit trail
@@ -383,11 +522,16 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         "send_image": _send_image,
         "write_article": _write_article,
         "improve_article": _improve_article,
+        "inject_links": _inject_links,
         "generate_images": _generate_images,
         "generate_hero_image": _generate_hero_image,
         "approve_hero_image": _approve_hero_image,
         "generate_infographic": _generate_infographic,
         "approve_infographic": _approve_infographic,
+        "generate_seo_metadata": _generate_seo_metadata,
+        "push_to_ghost": _push_to_ghost,
+        "fetch_promptlayer_execution": _fetch_pl_execution,
+        "fetch_history": _fetch_history,
     }
     fn = tools.get(name)
     if not fn:
@@ -424,6 +568,31 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         if "token" in err_str.lower() or "limit" in err_str.lower():
             retry_hint = "Try improve_article for smaller edits, or use a shorter topic with write_article."
         return {"success": False, "error": err_str, "retry_hint": retry_hint}
+
+
+# ---------------------------------------------------------------------------
+# Tool call parsing (for <tool_calls> XML emitted by the PromptLayer LLM)
+# ---------------------------------------------------------------------------
+
+def _parse_tool_calls(text: str) -> list[dict]:
+    """Parse <tool_calls>/<tool_call> XML blocks from LLM response text."""
+    tool_calls = []
+    for match in re.findall(r"<tool_calls>(.*?)</tool_calls>", text, re.DOTALL):
+        for call_json in re.findall(r"<tool_call>(.*?)</tool_call>", match, re.DOTALL):
+            try:
+                tc = json.loads(call_json.strip())
+                if isinstance(tc, dict) and "name" in tc:
+                    tool_calls.append(tc)
+            except json.JSONDecodeError:
+                logger.warning("[AGENT] Failed to parse tool_call JSON: %r", call_json[:200])
+    return tool_calls
+
+
+def _strip_tool_calls(text: str) -> str:
+    """Remove all <tool_calls>…</tool_calls> blocks from text."""
+    return re.sub(r"<tool_calls>.*?</tool_calls>", "", text, flags=re.DOTALL).strip()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -479,231 +648,157 @@ def run_agent(
         chat_id_token = _current_chat_id.set(channel_user_id)
 
     try:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY is required. Add it to your .env file.")
-        client = Anthropic(api_key=api_key)
+        # Build dynamic context for the workflow
+        context_parts = []
 
-        system = get_master_system_prompt() + (get_prompt("whatsapp_format") if format_for_whatsapp else "")
+        if format_for_whatsapp:
+            wp = get_prompt("whatsapp_format")
+            if wp:
+                context_parts.append(wp)
 
-        # Inject current context: channel, user, and article info
+        if os.getenv("GHOST_ADMIN_URL"):
+            context_parts.append(
+                "## Ghost Publishing\n"
+                "When the user asks to push, publish, send, or create a draft in Ghost "
+                "(e.g. 'push to ghost', 'send to ghost', 'ghost draft', 'publish to ghost'), "
+                "ALWAYS call the `push_to_ghost` tool immediately with the current article_id. "
+                "Do NOT narrate or describe the action — just call the tool."
+            )
+
+        # Fetch article context + history in parallel
+        history_limit = get_config_int("agent_history_limit", 10)
         if channel and channel_user_id:
-            system += f"\n\nCURRENT CONTEXT:\nchannel={channel}\nchannel_user_id={channel_user_id}"
+            context_parts.append(f"CURRENT CONTEXT:\nchannel={channel}\nchannel_user_id={channel_user_id}")
+            from concurrent.futures import ThreadPoolExecutor
+            from src.db import get_latest_article_for_user, list_articles, get_pending_article_images
+            from src.message_cache import get_recent_with_backfill
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_article = pool.submit(get_latest_article_for_user, channel, channel_user_id)
+                f_history = pool.submit(get_recent_with_backfill, channel, channel_user_id, limit=history_limit)
+                latest = f_article.result()
+                history = f_history.result()
+
             try:
-                from src.db import get_latest_article_for_user, list_articles, get_pending_article_images
-                latest = get_latest_article_for_user(channel, channel_user_id)
                 if latest:
-                    system += f"\nCurrent article: article_id={latest['id']}, title=\"{latest.get('title', 'Untitled')}\", version={latest.get('version', 1)}, status={latest.get('status', 'draft')}."
+                    ctx = f"Current article: article_id={latest['id']}, title=\"{latest.get('title', 'Untitled')}\", version={latest.get('version', 1)}, status={latest.get('status', 'draft')}."
                     if latest.get("google_doc_url"):
-                        system += f"\nGoogle Doc: {latest['google_doc_url']}"
-                    system += "\nWhen the user says \"the article\", \"it\", or refers to the draft - use this article_id. Do NOT ask for article_id."
-                    # Include pending image IDs for approve/reject tool calls
+                        ctx += f"\nGoogle Doc: {latest['google_doc_url']}"
+                        ctx += (
+                            "\nSOURCE OF TRUTH: The Google Doc is the authoritative version of the article content — "
+                            "humans may have edited it directly. When the user asks what the article says, shows, or contains, "
+                            "always use the google_docs tool (action='fetch') to read the current version. "
+                            "Use the database only for metadata (status, title, article_id, etc.)."
+                        )
+                    ctx += "\nWhen the user says \"the article\", \"it\", or refers to the draft - use this article_id. Do NOT ask for article_id."
                     try:
                         pending = get_pending_article_images(latest["id"])
                         if pending:
-                            system += "\nPending images (use these IDs for approve tools):"
+                            ctx += "\nPending images (use these IDs for approve tools):"
                             for img in pending[:5]:
-                                system += f"\n- image_id={img['id']}, type={img.get('image_type', 'generic')}"
+                                ctx += f"\n- image_id={img['id']}, type={img.get('image_type', 'generic')}"
                     except Exception:
                         pass
+                    context_parts.append(ctx)
                 else:
                     articles = list_articles(channel=channel, channel_user_id=channel_user_id, limit=3)
                     if articles:
-                        system += "\nRecent articles:"
+                        ctx = "Recent articles:"
                         for a in articles:
-                            system += f"\n- article_id={a['id']}, title=\"{a.get('title', 'Untitled')}\", status={a.get('status', 'draft')}"
+                            ctx += f"\n- article_id={a['id']}, title=\"{a.get('title', 'Untitled')}\", status={a.get('status', 'draft')}"
                             if a.get("google_doc_url"):
-                                system += f", doc={a['google_doc_url']}"
-                        system += "\nUse the most recent article_id when the user refers to \"the article\" or \"it\"."
+                                ctx += f", doc={a['google_doc_url']}"
+                        ctx += "\nUse the most recent article_id when the user refers to \"the article\" or \"it\"."
+                        context_parts.append(ctx)
                     else:
-                        system += "\nNo articles yet for this user."
+                        context_parts.append("No articles yet for this user.")
             except Exception as ctx_err:
                 logger.warning("[AGENT] Failed to load article context: %s", ctx_err)
 
-        # Note: We do NOT duplicate recent exchanges into the system prompt.
-        # The full conversation history is already passed as messages below,
-        # and the "Conversation Context" section in the system prompt instructs
-        # the model how to use it for resolving references like "it", "which one", etc.
+        # Build system prompt: core + playbooks + dynamic context
+        context_str = "\n\n".join(context_parts)
+        system = get_master_system_prompt()
+        if context_str.strip():
+            system = f"{system}\n\n{context_str}"
 
-        # Anthropic message format: list of {role, content}; system is separate
+        # Build Anthropic messages from history
         messages: list[dict] = []
-        if history:
-            for m in history[-get_config_int("agent_history_limit", 20):]:
-                messages.append({"role": m["role"], "content": m["content"]})
-        messages.append({"role": "user", "content": user_message})
+        for m in (history or [])[-history_limit:]:
+            role = m["role"]
+            content = m["content"] if isinstance(m["content"], str) else str(m["content"])
+            messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user_message.strip() or "(no message)"})
 
-        article = None
-        turns = 0
-        anthropic_tools = _openai_tools_to_anthropic()
-        model = get_config("agent_model", "claude-sonnet-4-5")
+        tools = _openai_tools_to_anthropic()
+        # Turn 0 uses Haiku for fast routing / conversational replies.
+        # Turn 1+ (after tool execution) uses Sonnet for synthesis and reasoning.
+        haiku_model = get_config("agent_haiku_model") or "claude-haiku-4-5-20251001"
+        sonnet_model = get_config("agent_model") or "claude-sonnet-4-5"
+        client = _AnthropicClient()
+        result_text = ""
 
-        while turns < max_turns:
-            start_ts = datetime.now(timezone.utc).isoformat()
-            start_perf = time.perf_counter()
-            response = client.messages.create(
-                model=model,
-                max_tokens=8192,
+        logger.info("[AGENT] Calling Anthropic directly: haiku=%s, sonnet=%s, messages=%d, tools=%d",
+                    haiku_model, sonnet_model, len(messages), len(tools))
+
+        for turn in range(max_turns):
+            current_model = haiku_model if turn == 0 else sonnet_model
+            max_tokens = 2048 if turn == 0 else 8096
+            resp = client.messages.create(
+                model=current_model,
+                max_tokens=max_tokens,
                 system=system,
                 messages=messages,
-                tools=anthropic_tools,
-                tool_choice={"type": "auto"},
+                tools=tools,
             )
-            end_ts = datetime.now(timezone.utc).isoformat()
-            duration_ms = (time.perf_counter() - start_perf) * 1000
+            logger.info("[AGENT] model=%s (turn %d)", current_model, turn + 1)
 
-            # Build agent_call metadata for observability
-            usage = getattr(response, "usage", None)
-            tokens = None
-            if usage:
-                tokens = {
-                    "input": getattr(usage, "input_tokens", None),
-                    "output": getattr(usage, "output_tokens", None),
-                    "total": (getattr(usage, "input_tokens", 0) or 0) + (getattr(usage, "output_tokens", 0) or 0),
-                }
-            thinking_blocks = []
-            text_parts_for_obs = []
-            tool_calls_for_obs = []
-            from src.observability import OBSERVABILITY_SAVE_PROMPTS
-            _preview_len = 2000 if OBSERVABILITY_SAVE_PROMPTS else 500
-            _thinking_len = 1500 if OBSERVABILITY_SAVE_PROMPTS else 500
-            for b in (response.content or []):
-                t = getattr(b, "type", None) or (b.get("type") if isinstance(b, dict) else None)
-                if t == "thinking":
-                    txt = getattr(b, "text", "") or b.get("text", "") if isinstance(b, dict) else ""
-                    thinking_blocks.append(txt[:_thinking_len] + ("..." if len(txt) > _thinking_len else ""))
-                elif t == "text":
-                    txt = getattr(b, "text", "") or b.get("text", "") if isinstance(b, dict) else ""
-                    text_parts_for_obs.append(txt)
-                elif t == "tool_use":
-                    nm = getattr(b, "name", "") or b.get("name", "")
-                    bid = getattr(b, "id", "") or b.get("id", "")
-                    # Capture the actual tool call input (arguments the agent chose)
-                    raw_input = getattr(b, "input", {}) or (b.get("input", {}) if isinstance(b, dict) else {})
-                    tc_entry = {"name": nm, "id": bid}
-                    if isinstance(raw_input, dict):
-                        # Sanitize + truncate each arg value for safe logging
-                        tc_entry["input"] = {
-                            k: (str(v)[:300] + "..." if len(str(v)) > 300 else str(v))
-                            for k, v in list(raw_input.items())[:10]
-                        }
-                    else:
-                        tc_entry["input"] = str(raw_input)[:500]
-                    tool_calls_for_obs.append(tc_entry)
-            # Build prompt metadata (include last user message when SAVE_PROMPTS)
-            prompt_obj = {
-                "system_len": len(system),
-                "messages_count": len(messages),
-                "tools_count": len(anthropic_tools),
-            }
-            if OBSERVABILITY_SAVE_PROMPTS and messages:
-                # Store the last user/tool_result message for context
-                last_msg = messages[-1]
-                last_content = last_msg.get("content", "")
-                if isinstance(last_content, str):
-                    prompt_obj["last_message_preview"] = last_content[:500] + ("..." if len(last_content) > 500 else "")
-                elif isinstance(last_content, list):
-                    # tool_result messages are lists
-                    parts = []
-                    for item in last_content[:3]:
-                        if isinstance(item, dict):
-                            c = item.get("content", item.get("text", ""))
-                            parts.append(str(c)[:200])
-                    prompt_obj["last_message_preview"] = " | ".join(parts)[:500]
-                prompt_obj["last_message_role"] = last_msg.get("role", "?")
-            response_obj = {
-                "content_preview": ("".join(text_parts_for_obs))[:_preview_len] + ("..." if len("".join(text_parts_for_obs)) > _preview_len else ""),
-                "thinking": thinking_blocks if thinking_blocks else None,
-                "tool_calls": tool_calls_for_obs,
-                "stop_reason": getattr(response, "stop_reason", None),
-            }
-            observe_agent_call(
-                name=f"agent_turn_{turns + 1}",
-                provider="anthropic",
-                model=model,
-                prompt=prompt_obj,
-                response=response_obj,
-                tokens=tokens,
-                span={"start_ts": start_ts, "end_ts": end_ts, "duration_ms": round(duration_ms, 2)},
-            )
+            # Extract text content
+            result_text = "\n".join(
+                b.text for b in resp.content if hasattr(b, "text")
+            ).strip()
+            logger.info("[AGENT] response: stop_reason=%s, text_len=%d",
+                        resp.stop_reason, len(result_text))
 
-            # Extract text and tool_use blocks from content
-            text_parts = []
-            tool_use_blocks = []
-            for block in (response.content or []):
-                if hasattr(block, "type"):
-                    if block.type == "text":
-                        text_parts.append(block.text)
-                    elif block.type == "tool_use":
-                        tool_use_blocks.append(block)
-                elif isinstance(block, dict):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
-                        tool_use_blocks.append(block)
+            if resp.stop_reason != "tool_use":
+                break
 
-            # No tool use: return the text response
-            if response.stop_reason != "tool_use" or not tool_use_blocks:
-                logger.info("[AGENT] No tool calls - returning final message (turn=%d)", turns + 1)
-                return {
-                    "message": "".join(text_parts).strip() or "",
-                    "article": article,
-                }
-
-            logger.info("[AGENT] Turn %d: %d tool call(s)", turns + 1, len(tool_use_blocks))
-
-            # Append assistant message — preserve ALL content blocks (text + tool_use)
+            # Serialize assistant message (text + tool_use blocks)
             assistant_content = []
-            for b in response.content or []:
-                if hasattr(b, "type"):
-                    if b.type == "text":
-                        assistant_content.append({"type": "text", "text": b.text})
-                    elif b.type == "tool_use":
-                        assistant_content.append({
-                            "type": "tool_use",
-                            "id": b.id,
-                            "name": b.name,
-                            "input": b.input,
-                        })
-                elif isinstance(b, dict):
-                    if b.get("type") == "text":
-                        assistant_content.append({"type": "text", "text": b.get("text", "")})
-                    elif b.get("type") == "tool_use":
-                        assistant_content.append(b)
+            for block in resp.content:
+                if block.type == "text":
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
             messages.append({"role": "assistant", "content": assistant_content})
 
-            # Execute each tool and build tool_result blocks
+            # Execute each tool and collect results
             tool_results = []
-            for block in tool_use_blocks:
-                bid = block.id if hasattr(block, "id") else block.get("id")
-                name = block.name if hasattr(block, "name") else block.get("name")
-                args = block.input if hasattr(block, "input") else block.get("input", {})
-                if not isinstance(args, dict):
-                    args = {}
-
-                if channel and channel_user_id and name in ("write_article",):
-                    args.setdefault("channel", channel)
-                    args.setdefault("channel_user_id", channel_user_id)
-
-                result = _execute_tool(name, args)
-                if isinstance(result, dict) and ("content" in result or "article_id" in result) and "article_id" in str(result):
-                    article = result
-
-                content_str = json.dumps(result) if not isinstance(result, str) else result
-                tool_results.append({"type": "tool_result", "tool_use_id": bid, "content": content_str})
-
+            for tu in [b for b in resp.content if b.type == "tool_use"]:
+                logger.info("[AGENT] Executing tool (turn %d): %s", turn + 1, tu.name)
+                result = _execute_tool(tu.name, tu.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": json.dumps(result, default=str),
+                })
             messages.append({"role": "user", "content": tool_results})
-            turns += 1
+        else:
+            logger.warning("[AGENT] Reached max_turns=%d without a final answer", max_turns)
 
-        logger.warning("[AGENT] Max turns (%d) reached", max_turns)
         return {
-            "message": "Maximum turns reached. Please try again.",
-            "article": article,
+            "message": result_text,
+            "article": None,
         }
     except TaskCancelledError:
         logger.info("[AGENT] Task cancelled by user")
         return {
             "message": "Cancelled.",
-            "article": article,
+            "article": None,
         }
     finally:
         if token is not None:

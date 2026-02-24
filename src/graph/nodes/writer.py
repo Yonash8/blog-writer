@@ -25,7 +25,8 @@ def writer_node(state: ArticleState) -> dict[str, Any]:
 
     logger.info("[WRITER] Calling PromptLayer, topic=%s, research_len=%d", topic[:80], len(research_text))
     try:
-        article_content = run_promptlayer_agent(topic, research_text)
+        pl_result = run_promptlayer_agent(topic, research_text)
+        article_content = pl_result.get("article", "")
     except Exception as e:
         from src.pipeline import _parse_promptlayer_error_for_user
         parsed = _parse_promptlayer_error_for_user(str(e))

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Shared helpers for graph nodes."""
 
 import logging

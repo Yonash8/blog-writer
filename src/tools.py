@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Tool implementations for the autonomous master agent.
 
 General-purpose tools:
@@ -319,6 +320,12 @@ def write_article(
 
     Returns dict with article_id, content, google_doc_url.
     """
+    # Fall back to ContextVars when the LLM doesn't pass channel explicitly
+    if not channel:
+        channel = _current_channel.get(None)
+    if not channel_user_id:
+        channel_user_id = _current_chat_id.get(None)
+
     logger.info("[TOOL] write_article: topic=%r, channel=%s, channel_user_id=%s, include_tavily=%s, tavily_max_results=%d",
                 topic, channel, channel_user_id, include_tavily, tavily_max_results)
     from src.pipeline import write_article as _write
@@ -327,8 +334,10 @@ def write_article(
     if not channel or not channel_user_id:
         return {"success": False, "error": "channel and channel_user_id are required", "retry_hint": "This should be set automatically by the agent."}
 
+    from src.pipeline import emit_status
+
     try:
-        content = _write(topic, include_tavily=include_tavily, tavily_max_results=tavily_max_results)
+        pl_result = _write(topic, include_tavily=include_tavily, tavily_max_results=tavily_max_results)
     except Exception as e:
         from src.pipeline import _parse_promptlayer_error_for_user
         parsed = _parse_promptlayer_error_for_user(str(e))
@@ -341,6 +350,10 @@ def write_article(
             }
         raise
 
+    content = pl_result.get("article", "")
+    metadata = pl_result.get("metadata")
+
+    emit_status("Saving article to database...")
     topic_rec = get_or_create_topic_for_article(topic)
     article = create_article(
         channel=channel,
@@ -351,6 +364,7 @@ def write_article(
         title=topic,
         changelog_entry=changelog_entry,
     )
+    emit_status("Creating Google Doc...")
     google_doc_url = None
     try:
         from src.google_docs import create_doc_from_markdown
@@ -370,6 +384,7 @@ def write_article(
         "content": content,
         "topic": topic,
         "google_doc_url": google_doc_url,
+        "metadata": metadata,
     }
 
 
@@ -430,7 +445,8 @@ def _revise_with_promptlayer(content: str, feedback: str) -> Optional[str]:
             raise RuntimeError("No execution ID")
 
         import time
-        for _ in range(60):
+        from src.pipeline import emit_status
+        for poll_i in range(60):
             res = client.get(
                 "https://api.promptlayer.com/workflow-version-execution-results",
                 headers={"X-API-KEY": api_key},
@@ -438,6 +454,9 @@ def _revise_with_promptlayer(content: str, feedback: str) -> Optional[str]:
                 timeout=30.0,
             )
             if res.status_code == 202:
+                if poll_i > 0 and poll_i % 4 == 0:
+                    elapsed_min = (poll_i + 1) * 15 // 60
+                    emit_status(f"Still improving... ({elapsed_min}m)")
                 time.sleep(15)
                 continue
             if res.status_code != 200:
@@ -490,6 +509,16 @@ def improve_article(
     current_content = article["content"]
     changelog_action = changelog_entry.strip() if changelog_entry and changelog_entry.strip() else None
 
+    # Use Google Docs as source of truth — humans may have edited the doc directly
+    google_doc_url = article.get("google_doc_url")
+    if google_doc_url:
+        from src.google_docs import fetch_doc_content, _document_id_from_url
+        doc_id = _document_id_from_url(google_doc_url)
+        if doc_id:
+            doc_result = fetch_doc_content(doc_id)
+            if doc_result.get("success") and doc_result.get("content"):
+                current_content = doc_result["content"]
+
     if use_promptlayer:
         try:
             revised = _revise_with_promptlayer(current_content, feedback)
@@ -505,10 +534,9 @@ def improve_article(
                 retry_hint = "Content too long for PromptLayer. Try without use_promptlayer for focused edits."
             return {"success": False, "error": err_str, "retry_hint": retry_hint}
 
-    # OpenAI path: edits + link injection
-    from src.config import get_config
+    # Anthropic path: edits + link injection via Claude Sonnet
     from src.prompts_loader import get_prompt
-    from openai import OpenAI
+    import anthropic as _anthropic
 
     links_section = ""
     if links:
@@ -520,7 +548,7 @@ def improve_article(
                 lines.append(f"  {i}. {url}" + (f" — use as: {title}" if title else ""))
         links_section = "\n" + "\n".join(lines)
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    anthropic_client = _anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     improve_prompt = get_prompt("improve_article")
     prompt = improve_prompt.format(
         feedback=feedback,
@@ -528,29 +556,27 @@ def improve_article(
         article=current_content,
     )
 
+    model = "claude-sonnet-4-5"
     start_ts = datetime.now(timezone.utc).isoformat()
     start_perf = time.perf_counter()
-    model = get_config("article_write_model", "gpt-4o")
-    response = client.chat.completions.create(
+    response = anthropic_client.messages.create(
         model=model,
+        max_tokens=8096,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
     )
     end_ts = datetime.now(timezone.utc).isoformat()
     duration_ms = (time.perf_counter() - start_perf) * 1000
-    revised = response.choices[0].message.content.strip()
+    revised = response.content[0].text.strip()
 
-    usage = getattr(response, "usage", None)
-    tokens = None
-    if usage:
-        tokens = {
-            "input": getattr(usage, "input_tokens", None),
-            "output": getattr(usage, "output_tokens", None),
-            "total": (getattr(usage, "total_tokens", None) or 0),
-        }
+    usage = response.usage
+    tokens = {
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "total": usage.input_tokens + usage.output_tokens,
+    }
     observe_agent_call(
         name="improve_article",
-        provider="openai",
+        provider="anthropic",
         model=model,
         prompt={"prompt_len": len(prompt), "messages_count": 1},
         response={"content_preview": revised[:500] + ("..." if len(revised) > 500 else "")},
@@ -570,6 +596,127 @@ def improve_article(
     update_article(article_id, revised, changelog_action=changelog_action)
     google_doc_url = _sync_article_to_google_doc(article_id, revised)
     return {"article_id": article_id, "content": revised, "google_doc_url": google_doc_url}
+
+
+# ---------------------------------------------------------------------------
+# Tool: inject_links — surgical link injection via Google Docs API
+# ---------------------------------------------------------------------------
+
+def inject_links(
+    article_id: str,
+    links: list[dict],
+) -> dict[str, Any]:
+    """Inject hyperlinks into an article surgically.
+
+    For articles with a Google Doc: Claude picks anchor phrases from the current doc text,
+    then link styles are applied directly via the Docs API — no rewrite.
+
+    For articles without a Google Doc: applies [phrase](url) replacements in DB markdown.
+    """
+    from src.db import get_article, update_article
+    from src.google_docs import (
+        fetch_doc_content,
+        inject_links_into_doc,
+        _document_id_from_url,
+    )
+
+    article = get_article(article_id)
+    if not article:
+        return {"success": False, "error": f"Article {article_id} not found"}
+
+    google_doc_url = article.get("google_doc_url")
+    document_id = _document_id_from_url(google_doc_url) if google_doc_url else None
+
+    # 1. Get current article text — prefer Google Docs as source of truth
+    current_text = article.get("content", "")
+    if document_id:
+        doc_result = fetch_doc_content(document_id)
+        if doc_result.get("success") and doc_result.get("content"):
+            current_text = doc_result["content"]
+
+    # 2. Ask Claude to map each URL → exact anchor phrase from the article text
+    import anthropic as _anthropic
+    import json as _json
+
+    links_lines = []
+    for i, lnk in enumerate(links[:10], 1):
+        line = f"  {i}. URL: {lnk.get('url', '')}"
+        if lnk.get("anchor_hint"):
+            line += f"\n     Anchor hint: {lnk['anchor_hint']}"
+        if lnk.get("context_hint"):
+            line += f"\n     Place near: {lnk['context_hint']}"
+        links_lines.append(line)
+
+    placement_prompt = (
+        "You are a link placement assistant. Given an article and a list of URLs, "
+        "return a JSON array of placement decisions.\n\n"
+        "For each URL, find the best SHORT phrase (3-8 words) in the article that "
+        "should become the clickable anchor text.\n\n"
+        "RULES:\n"
+        "- The phrase MUST be an exact verbatim substring of the article text below.\n"
+        "- Choose descriptive, natural phrases — not generic words like 'here' or 'this'.\n"
+        "- If anchor_hint is given, find the closest exact match in the text.\n"
+        "- Prefer the first occurrence of a phrase.\n"
+        "- Do NOT invent text that is not in the article.\n\n"
+        "Return ONLY valid JSON — no markdown, no explanation:\n"
+        '[{"url": "https://...", "phrase": "exact phrase from article"}, ...]\n\n'
+        f"Links:\n{chr(10).join(links_lines)}\n\n"
+        f"Article text:\n---\n{current_text[:6000]}\n---"
+    )
+
+    _client = _anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    resp = _client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": placement_prompt}],
+    )
+    raw = resp.content[0].text.strip()
+    # Strip markdown code block if present
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:])
+        if raw.endswith("```"):
+            raw = raw[: raw.rfind("```")]
+        raw = raw.strip()
+
+    try:
+        placements = _json.loads(raw)
+    except _json.JSONDecodeError:
+        return {"success": False, "error": "Failed to parse placement decisions from Claude", "raw": raw}
+
+    # 3a. Google Doc path — inject directly via Docs API, no rewrite
+    if document_id:
+        result = inject_links_into_doc(document_id, placements)
+        placed = result.get("placed", [])
+        not_placed = result.get("not_placed", [])
+        # Update DB changelog only; GDoc is source of truth for content
+        update_article(
+            article_id,
+            article.get("content", ""),
+            changelog_action=f"Injected {len(placed)} link(s) into Google Doc",
+        )
+        return {
+            "success": True,
+            "placed": placed,
+            "not_placed": not_placed,
+            "google_doc_url": google_doc_url,
+        }
+
+    # 3b. No Google Doc — apply [phrase](url) replacements in DB markdown
+    content = article.get("content", "")
+    placed = []
+    not_placed = []
+    for p in placements:
+        phrase = (p.get("phrase") or "").strip()
+        url = (p.get("url") or "").strip()
+        if phrase and url and phrase in content:
+            content = content.replace(phrase, f"[{phrase}]({url})", 1)
+            placed.append({"phrase": phrase, "url": url})
+        else:
+            not_placed.append({"phrase": phrase, "url": url, "reason": "phrase not found in content"})
+
+    update_article(article_id, content, changelog_action=f"Injected {len(placed)} link(s)")
+    new_doc_url = _sync_article_to_google_doc(article_id, content)
+    return {"success": True, "placed": placed, "not_placed": not_placed, "google_doc_url": new_doc_url}
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +799,7 @@ def generate_hero_image_tool(
     image for this article is used as a primary reference so the model can see
     what it is modifying, instead of generating from scratch with random refs.
     """
-    from src.db import get_article, add_article_image, get_pending_article_images, get_article_images
+    from src.db import get_article, add_article_image, get_pending_article_images, get_article_images, update_article_image_status
     from src.images import generate_hero_image, upload_to_supabase
 
     article = get_article(article_id)
@@ -662,25 +809,33 @@ def generate_hero_image_tool(
     logger.info("[TOOL] generate_hero_image: article_id=%s, description=%r, feedback=%r",
                 article_id[:8], description[:80], (feedback or "")[:80])
 
-    # When refining, find the previous hero image to use as reference
+    # Reject any previously pending hero images so only one pending exists at a time.
+    # This prevents the agent from accidentally approving a stale image_id from an
+    # earlier iteration (the most common cause of the wrong image being injected).
     previous_image_url = None
-    if feedback:
-        # Check pending hero images first (most recent)
-        pending = get_pending_article_images(article_id, image_type="hero")
-        if pending:
-            previous_image_url = pending[0].get("url")
-        else:
-            # Fall back to any hero image (including approved ones)
-            all_images = get_article_images(article_id)
-            hero_images = [i for i in all_images if i.get("image_type") == "hero"]
-            if hero_images:
-                previous_image_url = hero_images[-1].get("url")
-        if previous_image_url:
-            logger.info("[TOOL] generate_hero_image: using previous image as reference for refinement")
+    existing_pending = get_pending_article_images(article_id, image_type="hero")
+    if existing_pending:
+        previous_image_url = existing_pending[0].get("url")
+        for old_img in existing_pending:
+            try:
+                update_article_image_status(old_img["id"], "rejected")
+                logger.info("[TOOL] generate_hero_image: superseded pending image %s", old_img["id"][:8])
+            except Exception as e:
+                logger.warning("[TOOL] generate_hero_image: could not supersede image %s: %s", old_img["id"][:8], e)
+
+    if not previous_image_url and feedback:
+        # Fall back to any hero image (including approved ones) for visual reference
+        all_images = get_article_images(article_id)
+        hero_images = [i for i in all_images if i.get("image_type") == "hero"]
+        if hero_images:
+            previous_image_url = hero_images[-1].get("url")
+
+    if previous_image_url and feedback:
+        logger.info("[TOOL] generate_hero_image: using previous image as reference for refinement")
 
     try:
         img_bytes, prompt_used = generate_hero_image(
-            description, feedback=feedback, previous_image_url=previous_image_url,
+            description, feedback=feedback, previous_image_url=previous_image_url if feedback else None,
         )
     except Exception as e:
         return {"success": False, "error": f"Hero image generation failed: {e}"}
@@ -723,7 +878,7 @@ def approve_hero_image_tool(
     Content-safe: only prepends the hero image markdown above the existing
     content. Validates that existing content is preserved after injection.
     """
-    from src.db import get_article, get_article_image, update_article_image_status, update_article
+    from src.db import get_article, get_article_image, get_pending_article_images, update_article_image_status, update_article
     from src.images import inject_hero_into_markdown
 
     article = get_article(article_id)
@@ -737,8 +892,22 @@ def approve_hero_image_tool(
     image = get_article_image(image_id)
     if not image:
         return {"success": False, "error": f"Image {image_id} not found"}
+
+    # Fallback: if the requested image is no longer pending (e.g. it was superseded by a
+    # later iteration), automatically use the most recent pending hero image instead.
     if image.get("status") != "pending_approval":
-        return {"success": False, "error": f"Image is not pending approval (status: {image.get('status')})"}
+        latest_pending = get_pending_article_images(article_id, image_type="hero")
+        if latest_pending:
+            logger.warning(
+                "[TOOL] approve_hero_image: image %s is not pending (status=%s); "
+                "falling back to latest pending hero image %s",
+                image_id[:8], image.get("status"), latest_pending[0]["id"][:8],
+            )
+            image_id = latest_pending[0]["id"]
+            image = latest_pending[0]
+        else:
+            return {"success": False, "error": f"Image is not pending approval (status: {image.get('status')}) and no other pending hero image found"}
+
     if image.get("article_id") != article_id:
         return {"success": False, "error": "Image does not belong to this article"}
 
@@ -799,7 +968,7 @@ def generate_infographic_tool(
     for this article is used as a primary reference so the model can see what it is
     modifying.
     """
-    from src.db import get_article, add_article_image, get_pending_article_images, get_article_images
+    from src.db import get_article, add_article_image, get_pending_article_images, get_article_images, update_article_image_status
     from src.images import generate_infographic, upload_to_supabase
 
     article = get_article(article_id)
@@ -809,26 +978,36 @@ def generate_infographic_tool(
     logger.info("[TOOL] generate_infographic: article_id=%s, type=%s, feedback=%r",
                 article_id[:8], infographic_type, (feedback or "")[:80])
 
-    # When refining, find the previous infographic to use as reference
+    # Reject any previously pending infographic images so only one pending exists at a time.
+    # This prevents the agent from accidentally approving a stale image_id from an
+    # earlier iteration (the most common cause of the wrong image being injected).
     previous_image_url = None
-    if feedback:
-        pending = get_pending_article_images(article_id, image_type="infographic")
-        if pending:
-            previous_image_url = pending[0].get("url")
-        else:
-            all_images = get_article_images(article_id)
-            infographic_images = [i for i in all_images if i.get("image_type") == "infographic"]
-            if infographic_images:
-                previous_image_url = infographic_images[-1].get("url")
-        if previous_image_url:
-            logger.info("[TOOL] generate_infographic: using previous image as reference for refinement")
+    existing_pending = get_pending_article_images(article_id, image_type="infographic")
+    if existing_pending:
+        previous_image_url = existing_pending[0].get("url")
+        for old_img in existing_pending:
+            try:
+                update_article_image_status(old_img["id"], "rejected")
+                logger.info("[TOOL] generate_infographic: superseded pending image %s", old_img["id"][:8])
+            except Exception as e:
+                logger.warning("[TOOL] generate_infographic: could not supersede image %s: %s", old_img["id"][:8], e)
+
+    if not previous_image_url and feedback:
+        # Fall back to any infographic image (including approved ones) for visual reference
+        all_images = get_article_images(article_id)
+        infographic_images = [i for i in all_images if i.get("image_type") == "infographic"]
+        if infographic_images:
+            previous_image_url = infographic_images[-1].get("url")
+
+    if previous_image_url and feedback:
+        logger.info("[TOOL] generate_infographic: using previous image as reference for refinement")
 
     try:
         img_bytes, prompt_used, analysis = generate_infographic(
             article["content"],
             feedback=feedback,
             infographic_type=infographic_type,
-            previous_image_url=previous_image_url,
+            previous_image_url=previous_image_url if feedback else None,
         )
     except Exception as e:
         return {"success": False, "error": f"Infographic generation failed: {e}"}
@@ -886,7 +1065,7 @@ def approve_infographic_tool(
     Content-safe: only inserts the infographic markdown at the determined position.
     Validates that existing content is preserved after injection.
     """
-    from src.db import get_article, get_article_image, update_article_image_status, update_article
+    from src.db import get_article, get_article_image, get_pending_article_images, update_article_image_status, update_article
     from src.images import inject_infographic_into_markdown
 
     article = get_article(article_id)
@@ -900,8 +1079,22 @@ def approve_infographic_tool(
     image = get_article_image(image_id)
     if not image:
         return {"success": False, "error": f"Image {image_id} not found"}
+
+    # Fallback: if the requested image is no longer pending (e.g. it was superseded by a
+    # later iteration), automatically use the most recent pending infographic instead.
     if image.get("status") != "pending_approval":
-        return {"success": False, "error": f"Image is not pending approval (status: {image.get('status')})"}
+        latest_pending = get_pending_article_images(article_id, image_type="infographic")
+        if latest_pending:
+            logger.warning(
+                "[TOOL] approve_infographic: image %s is not pending (status=%s); "
+                "falling back to latest pending infographic %s",
+                image_id[:8], image.get("status"), latest_pending[0]["id"][:8],
+            )
+            image_id = latest_pending[0]["id"]
+            image = latest_pending[0]
+        else:
+            return {"success": False, "error": f"Image is not pending approval (status: {image.get('status')}) and no other pending infographic found"}
+
     if image.get("article_id") != article_id:
         return {"success": False, "error": "Image does not belong to this article"}
 
@@ -948,3 +1141,247 @@ def approve_infographic_tool(
         "google_doc_url": google_doc_url,
         "message": f"Infographic \"{meta.get('title', '')}\" approved and embedded in the article.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Pipeline tool: generate_seo_metadata
+# ---------------------------------------------------------------------------
+
+def generate_seo_metadata(article_id: str) -> dict[str, Any]:
+    """Call PromptLayer metadata agent on the article content and save to DB.
+
+    Sends the current article content to the PromptLayer metadata workflow
+    (PROMPTLAYER_METADATA_WORKFLOW, default "metadata agent"), stores the result
+    in the articles.seo_metadata column, and returns it.
+    """
+    from src.db import get_article, set_article_seo_metadata
+    from src.pipeline import run_metadata_agent, emit_status
+
+    logger.info("[TOOL] generate_seo_metadata: article_id=%s", article_id)
+
+    article = get_article(article_id)
+    if not article:
+        return {"success": False, "error": f"Article {article_id} not found"}
+
+    content = article.get("content", "")
+    if not content:
+        return {"success": False, "error": "Article has no content"}
+
+    try:
+        metadata, pl_exec_id = run_metadata_agent(content)
+    except Exception as e:
+        logger.exception("[TOOL] generate_seo_metadata EXCEPTION: %s", e)
+        return {"success": False, "error": str(e)}
+
+    # Normalise metadata: parse strings, resolve key aliases, normalise tags.
+    # This ensures the DB always has clean canonical keys that create_ghost_draft
+    # can use directly, regardless of what naming convention the metadata agent uses.
+    from src.ghost import _normalize_seo_metadata
+    metadata_to_store = _normalize_seo_metadata(metadata)
+
+    # If normalisation returned empty (e.g. completely unparseable), keep raw for debugging
+    if not metadata_to_store:
+        if isinstance(metadata, str):
+            metadata_to_store = {"raw": metadata}
+        elif isinstance(metadata, dict):
+            metadata_to_store = dict(metadata)
+        else:
+            metadata_to_store = {}
+
+    logger.info("[TOOL] generate_seo_metadata: normalised keys=%s", list(metadata_to_store.keys()))
+
+    # Record exec ID in SQLite (separate from seo_metadata — clean separation)
+    if pl_exec_id:
+        try:
+            from src.message_cache import add_pl_execution
+            add_pl_execution(
+                exec_id=pl_exec_id,
+                workflow=os.getenv("PROMPTLAYER_METADATA_WORKFLOW", "metadata agent"),
+                article_id=article_id,
+                channel=_current_channel.get(None),
+                channel_user_id=_current_chat_id.get(None),
+            )
+        except Exception as e:
+            logger.warning("[TOOL] generate_seo_metadata: failed to cache exec_id: %s", e)
+
+    emit_status("Saving SEO metadata...")
+    try:
+        set_article_seo_metadata(article_id, metadata_to_store)
+    except Exception as e:
+        logger.warning("[TOOL] generate_seo_metadata: failed to save to DB: %s", e)
+        return {"success": False, "error": f"Metadata generated but DB save failed: {e}", "metadata": metadata_to_store}
+
+    logger.info("[TOOL] generate_seo_metadata DONE: article_id=%s, pl_exec_id=%s", article_id, pl_exec_id)
+    return {
+        "article_id": article_id,
+        "metadata": metadata_to_store,
+        "pl_exec_id": pl_exec_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: push_to_ghost
+# ---------------------------------------------------------------------------
+
+
+def push_to_ghost(article_id: str) -> dict[str, Any]:
+    """Push the approved article to Ghost CMS as a draft.
+
+    Steps:
+    1. Fetch article from DB (content + hero_image_url + seo_metadata).
+    2. If seo_metadata is absent, run the metadata agent first and save it.
+    3. Call src.ghost.create_ghost_draft() which strips the hero image from the
+       inline markdown, converts MD to HTML, and POSTs to Ghost Admin API.
+    4. Return the Ghost editor URL and post ID.
+    """
+    from src.db import get_article
+    from src.ghost import create_ghost_draft
+    from src.pipeline import emit_status
+
+    logger.info("[TOOL] push_to_ghost: article_id=%s", article_id)
+
+    article = get_article(article_id)
+    if not article:
+        return {"success": False, "error": f"Article {article_id} not found"}
+
+    content = article.get("content", "")
+    if not content:
+        return {"success": False, "error": "Article has no content"}
+
+    # Ensure SEO metadata exists — generate if absent
+    metadata = article.get("seo_metadata") or {}
+    if not metadata:
+        emit_status("Generating SEO metadata before pushing to Ghost...")
+        meta_result = generate_seo_metadata(article_id)
+        if not meta_result.get("metadata"):
+            return {"success": False, "error": "Failed to generate SEO metadata for Ghost draft"}
+        metadata = meta_result["metadata"]
+
+    hero_url = article.get("hero_image_url")
+    title = article.get("title", "Untitled")
+
+    try:
+        emit_status("Creating Ghost draft...")
+        result = create_ghost_draft(
+            title=title,
+            content_md=content,
+            hero_image_url=hero_url,
+            metadata=metadata,
+        )
+    except Exception as e:
+        logger.exception("[TOOL] push_to_ghost EXCEPTION: %s", e)
+        return {"success": False, "error": str(e)}
+
+    logger.info("[TOOL] push_to_ghost DONE: ghost_id=%s", result.get("id"))
+    return {
+        "article_id": article_id,
+        "ghost_id": result["id"],
+        "ghost_url": result["url"],
+        "ghost_editor_url": result.get("editor_url", result["url"]),
+        "message": f"Ghost draft created successfully. Open in editor: {result.get('editor_url', result['url'])}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_promptlayer_execution
+# ---------------------------------------------------------------------------
+
+def fetch_promptlayer_execution(
+    execution_id: Optional[str] = None,
+    article_id: Optional[str] = None,
+    last_n: Optional[int] = None,
+) -> dict[str, Any]:
+    """Fetch PromptLayer workflow execution result(s).
+
+    Modes:
+      - execution_id: fetch a specific execution by its workflow_version_execution_id
+      - article_id: look up the stored _pl_exec_id from the article's seo_metadata and fetch it
+      - last_n: query the DB for the N most recent articles with a stored _pl_exec_id,
+                return their stored metadata (no re-fetch needed; PL result is already saved)
+
+    Note: PromptLayer's API only supports fetching by ID. last_n is served from our own DB.
+    """
+    import httpx as _httpx
+
+    api_key = os.getenv("PROMPTLAYER_API_KEY")
+
+    def _fetch_exec(exec_id: str) -> dict:
+        if not api_key:
+            return {"error": "PROMPTLAYER_API_KEY not set"}
+        with _httpx.Client() as client:
+            res = client.get(
+                "https://api.promptlayer.com/workflow-version-execution-results",
+                headers={"X-API-KEY": api_key},
+                params={"workflow_version_execution_id": exec_id, "return_all_outputs": True},
+                timeout=30.0,
+            )
+        if res.status_code == 202:
+            return {"exec_id": exec_id, "status": "still_running"}
+        if res.status_code != 200:
+            return {"exec_id": exec_id, "error": f"HTTP {res.status_code}: {res.text[:200]}"}
+        return {"exec_id": exec_id, "status": "done", "results": res.json()}
+
+    # --- Mode 1: direct execution ID ---
+    if execution_id:
+        logger.info("[TOOL] fetch_promptlayer_execution: by exec_id=%s", execution_id)
+        return _fetch_exec(execution_id)
+
+    # --- Mode 2: lookup via article (reads from SQLite) ---
+    if article_id:
+        from src.message_cache import get_recent_pl_executions
+        rows = get_recent_pl_executions(limit=20)  # search across all users
+        match = next((r for r in rows if r.get("article_id") == article_id), None)
+        if not match:
+            return {"success": False, "error": "No PromptLayer execution ID cached for this article. Run generate_seo_metadata first."}
+        exec_id = match["exec_id"]
+        logger.info("[TOOL] fetch_promptlayer_execution: article_id=%s -> exec_id=%s", article_id[:8], exec_id)
+        return _fetch_exec(exec_id)
+
+    # --- Mode 3: last N from SQLite cache ---
+    if last_n:
+        from src.message_cache import get_recent_pl_executions
+        channel = _current_channel.get(None)
+        channel_user_id = _current_chat_id.get(None)
+        rows = get_recent_pl_executions(channel=channel, channel_user_id=channel_user_id, limit=min(last_n, 20))
+        logger.info("[TOOL] fetch_promptlayer_execution: last_n=%d -> found %d records", last_n, len(rows))
+        return {"count": len(rows), "executions": rows}
+
+    return {"success": False, "error": "Provide execution_id, article_id, or last_n."}
+
+
+def fetch_history(before_timestamp: str, limit: int = 20, **_) -> dict:
+    """Fetch older conversation messages from SQLite cache (or Supabase fallback)."""
+    from src.tools import _current_channel, _current_chat_id
+    channel = _current_channel.get(None)
+    channel_user_id = _current_chat_id.get(None)
+    if not channel or not channel_user_id:
+        return {"error": "No channel context available.", "messages": []}
+    limit = min(int(limit), 50)
+    try:
+        from src.message_cache import get_before, count
+        cached = count(channel, channel_user_id)
+        if cached > 0:
+            msgs = get_before(channel, channel_user_id, before_timestamp=before_timestamp, limit=limit)
+        else:
+            # Fallback: query Supabase directly
+            from src.db import get_client
+            client = get_client()
+            r = (
+                client.table("messages")
+                .select("role, content, created_at")
+                .eq("channel", channel)
+                .eq("channel_user_id", channel_user_id)
+                .lt("created_at", before_timestamp)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            msgs = list(reversed(r.data or []))
+        logger.info("[TOOL] fetch_history: returned %d messages before %s", len(msgs), before_timestamp)
+        return {
+            "messages": [{"role": m["role"], "content": m["content"], "created_at": m.get("created_at")} for m in msgs],
+            "count": len(msgs),
+        }
+    except Exception as e:
+        logger.error("[TOOL] fetch_history error: %s", e)
+        return {"error": str(e), "messages": []}

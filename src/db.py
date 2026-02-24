@@ -62,7 +62,7 @@ def execute_sql(query: str) -> list[dict]:
 # --- Messages ---
 
 def add_message(channel: str, channel_user_id: str, role: str, content: str) -> dict:
-    """Add a message for a user."""
+    """Add a message for a user (writes to Supabase and local SQLite cache)."""
     client = get_client()
     r = client.table("messages").insert({
         "channel": channel,
@@ -72,7 +72,14 @@ def add_message(channel: str, channel_user_id: str, role: str, content: str) -> 
     }).execute()
     if not r.data or len(r.data) == 0:
         raise RuntimeError("Failed to add message")
-    return _to_dict(r.data[0])
+    row = _to_dict(r.data[0])
+    # Write-through to local SQLite cache
+    try:
+        from src.message_cache import add as cache_add
+        cache_add(str(row["id"]), channel, channel_user_id, role, content, str(row["created_at"]))
+    except Exception:
+        pass
+    return row
 
 
 def get_messages(channel: str, channel_user_id: str, limit: int = 100) -> list[dict]:
@@ -151,6 +158,15 @@ def set_article_status(article_id: str, status: str, changelog_entry: Optional[s
         raise RuntimeError("Failed to update article status")
     if changelog_entry and changelog_entry.strip():
         append_article_changelog(article_id, changelog_entry.strip())
+    return _to_dict(r.data[0])
+
+
+def set_article_seo_metadata(article_id: str, metadata: Any) -> dict:
+    """Store SEO metadata on the article row (seo_metadata JSONB column)."""
+    client = get_client()
+    r = client.table("articles").update({"seo_metadata": metadata}).eq("id", article_id).execute()
+    if not r.data or len(r.data) == 0:
+        raise RuntimeError(f"Failed to update seo_metadata for article {article_id}")
     return _to_dict(r.data[0])
 
 

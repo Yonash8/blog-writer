@@ -1,3 +1,4 @@
+from __future__ import annotations
 """FastAPI application for the article-writing chatbot."""
 
 import json
@@ -36,13 +37,23 @@ _progress_last_send: dict[tuple[str, str], float] = {}
 _progress_lock = threading.Lock()
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Eager-load all prompts from PromptLayer into memory
+    from src.prompts_loader import load_all_prompts
+    load_all_prompts()
+    yield
 
 app = FastAPI(
     title="Article-Writing Chatbot",
     description="Chatbot that writes articles via deep research, PromptLayer, and more.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -52,6 +63,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    """Require X-API-Key or Bearer token on all /api/* and /admin/* routes."""
+    path = request.url.path
+    open_paths = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+    if path in open_paths or path.startswith("/webhooks/"):
+        return await call_next(request)
+
+    web_api_key = os.getenv("WEB_API_KEY")
+    if not web_api_key:
+        # No key configured — allow all (local dev)
+        return await call_next(request)
+
+    auth = request.headers.get("Authorization", "")
+    x_key = request.headers.get("X-API-Key", "")
+    provided = auth[7:] if auth.startswith("Bearer ") else x_key
+
+    if provided != web_api_key:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 class ChatRequest(BaseModel):
@@ -295,7 +328,7 @@ def _log_whatsapp(msg: str) -> None:
 def _process_whatsapp_message(
     chat_id: str, text: str, quoted_message_id: Optional[str] = None
 ) -> None:
-    """Process incoming WhatsApp message via LangGraph workflow (runs in background)."""
+    """Process incoming WhatsApp message via Opus agent (runs in background)."""
     trace_id = str(uuid.uuid4())
     whatsapp_start = time.perf_counter()
     log_event(
@@ -307,244 +340,80 @@ def _process_whatsapp_message(
     logger.info("[WHATSAPP] Processing: chat_id=%s, text=%r", chat_id, text[:100])
     _log_whatsapp(f"[WhatsApp] IN {chat_id}: {repr(text)}")
 
-    from src.channels.whatsapp import send_message_chunked, send_image_by_url
-    from src.db import get_messages_for_user, add_message_for_user
+    from src.agent import run_agent
+    from src.channels.whatsapp import send_message_chunked
+    from src.db import add_message_for_user
     from src.task_state import set_task, clear_task
-    from src.graph.pre_router import classify_pre_intent
-    from src.graph.graph import get_graph
-    from src.graph.thread_manager import get_active_thread, get_or_create_thread_id
-    from src.pipeline import status_callback as pipeline_status_callback
 
     set_task("whatsapp", chat_id, "Processing your request...")
-    # Status callback: always set_task; optionally send as WhatsApp message (CRM check-back)
+
     def _on_status(status_text: str) -> None:
         set_task("whatsapp", chat_id, status_text)
-        if os.getenv("CRM_SEND_PROGRESS_MESSAGES", "").lower() in ("1", "true", "yes"):
-            throttle_sec = int(os.getenv("CRM_PROGRESS_THROTTLE_SEC", "45"))
-            now = time.monotonic()
-            key = ("whatsapp", chat_id)
-            with _progress_lock:
-                last = _progress_last_send.get(key, 0.0)
-                if now - last >= throttle_sec:
-                    _progress_last_send[key] = now
-                    try:
-                        send_message_chunked(chat_id, status_text, quoted_message_id=quoted_message_id)
-                    except Exception as e:
-                        logger.warning("[WHATSAPP] Progress message send failed: %s", e)
+        throttle_sec = int(os.getenv("CRM_PROGRESS_THROTTLE_SEC", "10"))
+        now = time.monotonic()
+        key = ("whatsapp", chat_id)
+        with _progress_lock:
+            last = _progress_last_send.get(key, 0.0)
+            if now - last >= throttle_sec:
+                _progress_last_send[key] = now
+                try:
+                    send_message_chunked(chat_id, f"_{status_text}_", quoted_message_id=None)
+                except Exception as e:
+                    logger.warning("[WHATSAPP] Progress message send failed: %s", e)
 
-    status_token = pipeline_status_callback.set(_on_status)
-
+    response = ""
     try:
-        # 1. Pre-route: general question or article-related?
-        # Check active thread first so we can pass stage context to the pre-router
-        active = get_active_thread(chat_id)
-        active_stage = None
-        _active_graph_paused = False
-        if active and active.get("thread_id"):
-            try:
-                _g = get_graph()
-                _cfg = {"configurable": {"thread_id": active["thread_id"]}}
-                _gs = _g.get_state(_cfg)
-                if _gs and _gs.values:
-                    active_stage = (_gs.values or {}).get("stage")
-                if _gs and _gs.next:
-                    _active_graph_paused = True
-            except Exception:
-                pass
-
-        pre_intent = classify_pre_intent(text, active_stage=active_stage)
-        logger.info("[WHATSAPP] Pre-intent: %s (active_stage=%s, paused=%s)", pre_intent, active_stage, _active_graph_paused)
-
-        # If classified as general but there's an active thread paused at interrupt,
-        # the message is almost certainly a response to that interrupt
-        if pre_intent == "general_question" and _active_graph_paused:
-            pre_intent = "article_intent"
-            logger.info("[WHATSAPP] Override to article_intent (graph paused at interrupt)")
-
-        # Load recent chat history for conversational context
-        msgs = get_messages_for_user("whatsapp", chat_id)
-        recent_messages = [{"role": m["role"], "content": m["content"]} for m in msgs[-20:]]
-
-        if pre_intent in ("help", "list_articles"):
-            # Handle directly via the graph with a dedicated thread
-            graph = get_graph()
-            thread_id = f"{chat_id}:meta"
-            config = {"configurable": {"thread_id": thread_id}}
-            result = graph.invoke(
-                {
-                    "user_message": text,
-                    "whatsapp_user_id": chat_id,
-                    "recent_messages": recent_messages,
-                    "intent": pre_intent,
-                },
-                config,
-            )
-            response = result.get("response_to_user", "")
-        elif pre_intent == "general_question":
-            # Handle general question via graph (no article thread)
-            graph = get_graph()
-            thread_id = f"{chat_id}:general:{trace_id}"
-            config = {"configurable": {"thread_id": thread_id}}
-            result = graph.invoke(
-                {
-                    "user_message": text,
-                    "whatsapp_user_id": chat_id,
-                    "recent_messages": recent_messages,
-                },
-                config,
-            )
-            response = result.get("response_to_user", "")
-        else:
-            # Article-related intent -> use article thread
-            graph = get_graph()
-            thread_id = get_or_create_thread_id(chat_id, text)
-            config = {"configurable": {"thread_id": thread_id}}
-
-            # Check if graph is paused at an interrupt
-            try:
-                graph_state = graph.get_state(config)
-            except Exception:
-                graph_state = None
-
-            if graph_state and graph_state.next:
-                # Resume from interrupt with user's message
-                from langgraph.types import Command
-                logger.info("[WHATSAPP] Resuming graph from interrupt, next=%s", graph_state.next)
-
-                # Before resuming, send any pending image previews
-                current_state = graph_state.values or {}
-                _send_pending_images(chat_id, current_state, quoted_message_id)
-
-                result = graph.invoke(
-                    Command(resume=text),
-                    config,
-                )
-            else:
-                # Fresh invocation (CRM: confirmation_gate interrupts with "I understood..." if start_article)
-                result = graph.invoke(
-                    {
-                        "user_message": text,
-                        "whatsapp_user_id": chat_id,
-                        "recent_messages": recent_messages,
-                    },
-                    config,
-                )
-
-            # Extract message: prefer interrupt payload (confirmation, draft approval, etc.), else response_to_user
-            response = ""
-            interrupts = (result.get("__interrupt__") or []) if isinstance(result, dict) else []
-            first_interrupt_payload = None
-            if interrupts:
-                first = interrupts[0]
-                payload = getattr(first, "value", first) if not isinstance(first, dict) else first
-                first_interrupt_payload = payload if isinstance(payload, dict) else None
-                if first_interrupt_payload and first_interrupt_payload.get("message"):
-                    response = first_interrupt_payload["message"]
-            if not response and isinstance(result, dict):
-                response = result.get("response_to_user", "")
-
-            # Send any image previews: prefer interrupt payload (hero/infographic approval), else state
-            _send_pending_images(
-                chat_id,
-                result if isinstance(result, dict) else {},
-                quoted_message_id,
-                interrupt_payload=first_interrupt_payload,
-            )
-
+        result = run_agent(
+            user_message=text,
+            history=[],  # run_agent loads its own history from SQLite cache
+            channel="whatsapp",
+            channel_user_id=chat_id,
+            format_for_whatsapp=True,
+            on_status=_on_status,
+            trace_id=trace_id,
+        )
+        response = result.get("message", "")
     except Exception as e:
-        logger.exception("LangGraph error for WhatsApp %s: %s", chat_id, e)
-        add_message_for_user("whatsapp", chat_id, "user", text)
+        logger.exception("[WHATSAPP] Agent error for %s: %s", chat_id, e)
         from src.response_interpreter import explain_to_user
-        friendly = explain_to_user(str(e))
-        add_message_for_user("whatsapp", chat_id, "assistant", friendly)
-        _log_whatsapp(f"[WhatsApp] OUT {chat_id} (error->interpreted): {repr(friendly)}")
+        response = explain_to_user(str(e))
+        add_message_for_user("whatsapp", chat_id, "user", text)
+        add_message_for_user("whatsapp", chat_id, "assistant", response)
+        _log_whatsapp(f"[WhatsApp] OUT {chat_id} (error->interpreted): {repr(response[:200])}")
         try:
-            send_message_chunked(
-                chat_id, friendly, quoted_message_id=quoted_message_id
-            )
+            send_message_chunked(chat_id, response, quoted_message_id=quoted_message_id)
         except Exception as send_err:
             logger.exception("Failed to send error reply: %s", send_err)
         return
     finally:
-        pipeline_status_callback.reset(status_token)
         clear_task("whatsapp", chat_id)
         with _progress_lock:
             _progress_last_send.pop(("whatsapp", chat_id), None)
 
-    logger.info("[WHATSAPP] LangGraph done: response_len=%d", len(response))
+    logger.info("[WHATSAPP] Agent done: response_len=%d", len(response))
     out_preview = response[:200] + ("..." if len(response) > 200 else "")
     _log_whatsapp(f"[WhatsApp] OUT {chat_id}: {repr(out_preview)}")
-    add_message_for_user("whatsapp", chat_id, "user", text)
-    add_message_for_user("whatsapp", chat_id, "assistant", response)
 
-    total_ms = (time.perf_counter() - whatsapp_start) * 1000
-    log_event(
-        "request_done",
-        total_latency_ms=round(total_ms, 2),
-        final_message_len=len(response),
-    )
-    persist_trace(response)
-
+    # Send reply immediately — don't wait for DB writes
     try:
         if response:
-            send_message_chunked(
-                chat_id, response, quoted_message_id=quoted_message_id
-            )
+            send_message_chunked(chat_id, response, quoted_message_id=quoted_message_id)
     except Exception as e:
         logger.exception("Failed to send WhatsApp reply to %s: %s", chat_id, e)
 
+    # Persist to Supabase + observability in background (SQLite cache is already written via add_message)
+    def _persist():
+        try:
+            add_message_for_user("whatsapp", chat_id, "user", text)
+            add_message_for_user("whatsapp", chat_id, "assistant", response)
+            total_ms = (time.perf_counter() - whatsapp_start) * 1000
+            log_event("request_done", total_latency_ms=round(total_ms, 2), final_message_len=len(response))
+            persist_trace(response)
+        except Exception as e:
+            logger.warning("[WHATSAPP] Background persist failed: %s", e)
 
-def _send_pending_images(
-    chat_id: str,
-    state: dict,
-    quoted_message_id: Optional[str] = None,
-    interrupt_payload: Optional[dict] = None,
-) -> None:
-    """Send hero/infographic image previews to WhatsApp if present in state or interrupt payload."""
-    from src.channels.whatsapp import send_image_by_url
-
-    # Prefer image_url from interrupt payload, fallback to state (LangGraph may not include url in payload)
-    if interrupt_payload:
-        itype = interrupt_payload.get("type")
-        url = interrupt_payload.get("image_url")
-        if not url and itype == "hero_approval":
-            url = state.get("hero_image_url")
-        if not url and itype == "infographic_approval":
-            url = state.get("infographic_image_url")
-        if itype in ("hero_approval", "infographic_approval") and not url:
-            logger.warning(
-                "[WHATSAPP] No image_url for %s: payload=%s, state_keys=%s",
-                itype,
-                {k: str(v)[:80] for k, v in interrupt_payload.items()},
-                list(state.keys())[:20],
-            )
-        if url and itype == "hero_approval":
-            try:
-                send_image_by_url(chat_id, url, caption="Hero image preview")
-                logger.info("[WHATSAPP] Sent hero preview (from interrupt): %s", url[:60])
-            except Exception as e:
-                logger.warning("[WHATSAPP] Failed to send hero preview: %s", e)
-            return  # Sent hero, skip state-based check
-        if url and itype == "infographic_approval":
-            try:
-                send_image_by_url(chat_id, url, caption="Infographic preview")
-                logger.info("[WHATSAPP] Sent infographic preview (from interrupt): %s", url[:60])
-            except Exception as e:
-                logger.warning("[WHATSAPP] Failed to send infographic preview: %s", e)
-            return
-
-    # Fallback: check state (for edge cases where interrupt payload isn't used)
-    for url_key, caption in [
-        ("hero_image_url", "Hero image preview"),
-        ("infographic_image_url", "Infographic preview"),
-    ]:
-        url = state.get(url_key)
-        if url and state.get("stage", "").startswith("awaiting_"):
-            try:
-                send_image_by_url(chat_id, url, caption=caption)
-                logger.info("[WHATSAPP] Sent %s preview: %s", url_key, url[:60])
-            except Exception as e:
-                logger.warning("[WHATSAPP] Failed to send %s preview: %s", url_key, e)
+    import threading
+    threading.Thread(target=_persist, daemon=True).start()
 
 
 @app.post("/webhooks/green-api/whatsapp")
@@ -581,7 +450,7 @@ async def green_api_whatsapp_webhook(request: Request):
         return {"ok": True}
 
     # Only respond to this chat ID - ignore all others
-    ALLOWED_CHAT_ID = "972546678582@c.us"
+    ALLOWED_CHAT_ID = os.getenv("WHATSAPP_ALLOWED_CHAT_ID", "")
     if chat_id != ALLOWED_CHAT_ID:
         _log_whatsapp(f"[WhatsApp] Ignored {chat_id} (allowed: {ALLOWED_CHAT_ID}): {repr(text)[:50]}")
         return {"ok": True}
@@ -762,25 +631,6 @@ async def api_get_trace(trace_id: str):
     return trace
 
 
-@app.get("/api/last-deep-research")
-async def api_last_deep_research():
-    """API: get the most recent deep research (topic, content, timestamp). Available even when file save is disabled."""
-    from src.pipeline import get_last_deep_research
-
-    return get_last_deep_research()
-
-
-@app.get("/admin/last-deep-research")
-async def admin_last_deep_research(request: Request):
-    """Admin page: view the most recent deep research."""
-    from src.pipeline import get_last_deep_research
-
-    data = get_last_deep_research()
-    return templates.TemplateResponse(
-        "admin/last_deep_research.html",
-        {"request": request, "topic": data.get("topic", ""), "content": data.get("content", ""), "at": data.get("at", "")},
-    )
-
 
 # --- Admin: Agent config and prompts ---
 
@@ -895,70 +745,14 @@ async def admin_graph_state(request: Request):
 
 @app.get("/api/admin/graph-state")
 async def api_get_graph_state(whatsapp_user_id: Optional[str] = None):
-    """Get current graph state for a user's active thread."""
+    """Deprecated: LangGraph removed. Returns threads from DB for reference."""
+    from src.db import get_client
     try:
-        from src.graph.graph import get_graph
-        from src.graph.thread_manager import get_active_thread
-
-        if not whatsapp_user_id:
-            from src.db import get_client
-            try:
-                r = get_client().table("active_article_threads").select("*").execute()
-                threads = r.data or []
-            except Exception:
-                threads = []
-            return {"threads": threads}
-
-        active = get_active_thread(whatsapp_user_id)
-        if not active or not active.get("thread_id"):
-            return {"error": "No active thread", "thread": None, "state": None}
-
-        # Sanitize thread dict for JSON (Supabase may return datetime etc.)
-        thread_safe = {k: str(v) if hasattr(v, "isoformat") else v for k, v in active.items()}
-
-        thread_id = active["thread_id"]
-        graph = get_graph()
-        config = {"configurable": {"thread_id": thread_id}}
-
-        try:
-            gs = graph.get_state(config)
-        except Exception as e:
-            return {"error": str(e), "thread": thread_safe, "state": None, "next": None}
-
-        if not gs:
-            return {"thread": thread_safe, "state": None, "next": None}
-
-        # Serialize state values (strip large fields, ensure JSON-safe)
-        def _to_jsonable(v):
-            if hasattr(v, "isoformat"):
-                return str(v)
-            if isinstance(v, dict):
-                return {k: _to_jsonable(x) for k, x in v.items()}
-            if isinstance(v, (list, tuple)):
-                return [_to_jsonable(x) for x in v]
-            if isinstance(v, (str, int, float, bool, type(None))):
-                return v
-            return str(v)
-
-        values = dict(gs.values) if gs.values else {}
-        for k in ("research_text", "recent_messages", "response_to_user"):
-            if k in values and isinstance(values[k], str) and len(values[k]) > 500:
-                values[k] = values[k][:500] + f"... [{len(values[k])} chars]"
-        if "recent_messages" in values and isinstance(values["recent_messages"], list):
-            values["recent_messages"] = f"[{len(values['recent_messages'])} messages]"
-        if "actions_log" in values and isinstance(values["actions_log"], list):
-            values["actions_log"] = values["actions_log"][-10:]
-        values = _to_jsonable(values)
-
-        return {
-            "thread": thread_safe,
-            "state": values,
-            "next": list(gs.next) if gs.next else [],
-            "created_at": str(gs.created_at) if hasattr(gs, "created_at") and gs.created_at else None,
-        }
-    except Exception as e:
-        logger.exception("api_get_graph_state failed: %s", e)
-        return {"error": str(e), "thread": None, "state": None, "next": None, "threads": []}
+        r = get_client().table("active_article_threads").select("*").execute()
+        threads = r.data or []
+    except Exception:
+        threads = []
+    return {"deprecated": "LangGraph removed — agent is now stateless", "threads": threads}
 
 
 @app.get("/admin/agents")

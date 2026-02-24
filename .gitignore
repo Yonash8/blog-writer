@@ -1,3 +1,6 @@
+# macOS
+.DS_Store
+
 # Secrets and credentials (never commit)
 .env
 .env.*
@@ -18,3 +21,6 @@ last_deep_research.md
 langgraph.db*
 test_checkpointer.db
 test_output_image.png
+
+# Local SQLite message cache
+data/messages.db

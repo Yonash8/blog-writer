@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Hero image sub-flow: description gate -> generator -> approval gate."""
 
 import logging

@@ -41,3 +41,12 @@ Resolve article_id, check if google_doc_url exists. Create or update accordingly
 
 ### List Articles / Browse Topics
 Query the db and format results for the user.
+
+### Push to Ghost
+When user says "push to ghost", "send to ghost", "ghost draft", or "publish":
+Call push_to_ghost(article_id=...) immediately — do NOT narrate, just call the tool.
+Returns a Ghost editor URL. Share it with the user.
+
+### SEO Metadata
+After article is approved, call generate_seo_metadata(article_id=...) to generate and save SEO fields.
+This is called automatically by push_to_ghost if not already done.

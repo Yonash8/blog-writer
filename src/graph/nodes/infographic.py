@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Infographic sub-flow: analysis -> generator -> approval gate."""
 
 import logging

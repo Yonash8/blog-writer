@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Article resolver node: searches DB for referenced articles and confirms with user.
 
 Runs after the router for any intent that needs an article.
