@@ -503,6 +503,95 @@ async def green_api_whatsapp_webhook(request: Request):
     return {"ok": True}
 
 
+def _process_gdrive_change(article_id: str) -> None:
+    """Fetch the Google Doc and detect manual edits. Runs in a background thread."""
+    from src.db import get_article
+    from src.google_docs import fetch_doc_content, _document_id_from_url
+    from src.tools import _detect_and_log_manual_edits
+
+    try:
+        article = get_article(article_id)
+        if not article:
+            logger.warning("[GDRIVE] article %s not found", article_id[:8])
+            return
+
+        google_doc_url = article.get("google_doc_url")
+        if not google_doc_url:
+            return
+
+        doc_id = _document_id_from_url(google_doc_url)
+        if not doc_id:
+            return
+
+        doc_result = fetch_doc_content(doc_id)
+        if not doc_result.get("success"):
+            logger.warning("[GDRIVE] Could not fetch doc for article %s: %s", article_id[:8], doc_result.get("error"))
+            return
+
+        gdoc_text = doc_result.get("content", "")
+        db_content = article.get("content", "")
+        _detect_and_log_manual_edits(article_id, db_content, gdoc_text)
+
+        # Opportunistically renew the watch if expiring within 24 hours
+        try:
+            from src.db import get_gdrive_watch
+            from src.google_docs import ensure_gdrive_watch
+            watch = get_gdrive_watch(article_id)
+            if watch and doc_id:
+                import time as _time
+                expiry_ms = watch.get("expiry_ms", 0)
+                if expiry_ms - int(_time.time() * 1000) < 86_400_000:
+                    renewed = ensure_gdrive_watch(doc_id, article_id)
+                    if renewed:
+                        logger.info("[GDRIVE] Watch renewed for article %s (channel=%s)", article_id[:8], renewed["channel_id"][:8])
+        except Exception as re:
+            logger.warning("[GDRIVE] Watch renewal failed: %s", re)
+
+        logger.info("[GDRIVE] Processed change for article %s", article_id[:8])
+    except Exception as e:
+        logger.exception("[GDRIVE] Error processing change notification: %s", e)
+
+
+@app.post("/webhooks/gdrive-changes")
+async def gdrive_changes_webhook(request: Request):
+    """Google Drive push notification webhook.
+
+    Drive sends a POST here whenever a watched document changes.
+    Key headers:
+      X-Goog-Channel-Id      — our channel UUID
+      X-Goog-Channel-Token   — article_id we supplied at registration time
+      X-Goog-Resource-State  — 'sync' (initial ack) | 'update' | 'change'
+      X-Goog-Message-Number  — sequential int (1 = sync)
+    """
+    resource_state = request.headers.get("X-Goog-Resource-State", "")
+    channel_id = request.headers.get("X-Goog-Channel-Id", "")
+    article_id = request.headers.get("X-Goog-Channel-Token", "")
+
+    logger.info(
+        "[GDRIVE] Webhook: state=%s, channel=%s, article=%s",
+        resource_state,
+        channel_id[:8] if channel_id else "?",
+        article_id[:8] if article_id else "?",
+    )
+
+    # Always return 200 immediately — Drive will retry on non-2xx
+    if resource_state == "sync":
+        # Initial acknowledgement event; no actual change yet
+        return {"ok": True}
+
+    if not article_id or resource_state not in ("update", "change"):
+        return {"ok": True}
+
+    # Validate article_id looks like a UUID before touching the DB
+    import re as _re
+    if not _re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', article_id):
+        logger.warning("[GDRIVE] Invalid article_id in token: %r", article_id[:40])
+        return {"ok": True}
+
+    asyncio.create_task(asyncio.to_thread(_process_gdrive_change, article_id))
+    return {"ok": True}
+
+
 @app.get("/api/articles")
 async def list_articles(
     channel: Optional[str] = None,

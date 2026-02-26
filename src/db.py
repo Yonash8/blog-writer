@@ -578,6 +578,46 @@ def update_optimization_session(session_id: str, updates: dict) -> Optional[dict
     return _to_dict(r.data[0])
 
 
+# --- Google Drive watch ---
+
+def get_gdrive_watch(article_id: str) -> Optional[dict]:
+    """Get stored GDrive watch info from article metadata. Returns None if not set."""
+    client = get_client()
+    r = client.table("articles").select("metadata").eq("id", article_id).execute()
+    if not r.data:
+        return None
+    meta = r.data[0].get("metadata") or {}
+    return meta.get("gdrive_watch") or None
+
+
+def set_gdrive_watch(article_id: str, watch_info: dict) -> None:
+    """Upsert GDrive watch info into article metadata."""
+    client = get_client()
+    r = client.table("articles").select("metadata").eq("id", article_id).execute()
+    if not r.data:
+        return
+    meta = r.data[0].get("metadata") or {}
+    meta["gdrive_watch"] = watch_info
+    client.table("articles").update({"metadata": meta}).eq("id", article_id).execute()
+
+
+def find_article_by_gdrive_channel(channel_id: str) -> Optional[dict]:
+    """Find article whose gdrive_watch.channel_id matches. Used as fallback if token isn't set."""
+    client = get_client()
+    # Postgres JSONB path filter: metadata->'gdrive_watch'->>'channel_id' = channel_id
+    r = client.rpc(
+        "execute_readonly_sql",
+        {"query": f"SELECT id FROM articles WHERE metadata->'gdrive_watch'->>'channel_id' = '{channel_id}' LIMIT 1"},
+    ).execute()
+    rows = r.data or []
+    if not rows:
+        return None
+    article_id = rows[0].get("id")
+    if not article_id:
+        return None
+    return get_article(article_id)
+
+
 def list_optimization_sessions(limit: int = 20) -> list[dict]:
     """List recent optimization sessions."""
     client = get_client()

@@ -236,14 +236,20 @@ def generate_hero_image(
     """
     hero_template = get_prompt("hero_image")
 
-    if feedback and previous_image_url:
-        # Refinement: use the previous image as primary reference so the model
-        # can see what to change, plus 1 style ref for palette consistency.
+    if previous_image_url:
+        # Always use previous image for visual continuity.
+        # Refinement (feedback set): previous image + 1 style ref so model sees what to change.
+        # Fresh-with-continuity (no feedback): previous image + 2 style refs for more variety.
         try:
             previous_bytes = _download_image(previous_image_url)
-            style_refs = fetch_random_references("heros", count=1)
-            refs = [previous_bytes] + style_refs
-            logger.info("[IMAGES] Hero refinement: using previous image + 1 style ref")
+            if feedback:
+                style_refs = fetch_random_references("heros", count=1)
+                refs = [previous_bytes] + style_refs
+                logger.info("[IMAGES] Hero refinement: using previous image + 1 style ref")
+            else:
+                style_refs = fetch_random_references("heros", count=2)
+                refs = [previous_bytes] + style_refs
+                logger.info("[IMAGES] Hero fresh (visual continuity): using previous image + 2 style refs")
         except Exception as e:
             logger.warning("[IMAGES] Failed to download previous image (%s), falling back to 3 random refs", e)
             refs = fetch_random_references("heros", count=3)
@@ -371,13 +377,18 @@ def generate_infographic(
     if infographic_type:
         analysis["infographic_type"] = infographic_type
 
-    # Step 2: Fetch references — use previous image when refining
-    if feedback and previous_image_url:
+    # Step 2: Fetch references — always include previous image when available for visual continuity.
+    if previous_image_url:
         try:
             previous_bytes = _download_image(previous_image_url)
-            style_refs = fetch_random_references("infographics", count=1)
-            refs = [previous_bytes] + style_refs
-            logger.info("[IMAGES] Infographic refinement: using previous image + 1 style ref")
+            if feedback:
+                style_refs = fetch_random_references("infographics", count=1)
+                refs = [previous_bytes] + style_refs
+                logger.info("[IMAGES] Infographic refinement: using previous image + 1 style ref")
+            else:
+                style_refs = fetch_random_references("infographics", count=2)
+                refs = [previous_bytes] + style_refs
+                logger.info("[IMAGES] Infographic fresh (visual continuity): using previous image + 2 style refs")
         except Exception as e:
             logger.warning("[IMAGES] Failed to download previous infographic (%s), falling back to 3 random refs", e)
             refs = fetch_random_references("infographics", count=3)

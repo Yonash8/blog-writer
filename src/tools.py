@@ -373,6 +373,18 @@ def write_article(
         if google_doc_url:
             set_article_google_doc_url(article["id"], google_doc_url)
             logger.info("[TOOL] write_article: created Google Doc %s", google_doc_url[:60])
+            # Register Google Drive push notification watch for manual-edit detection
+            try:
+                from src.google_docs import ensure_gdrive_watch, _document_id_from_url
+                doc_id = result.get("document_id") or _document_id_from_url(google_doc_url)
+                if doc_id:
+                    watch = ensure_gdrive_watch(doc_id, article["id"])
+                    if watch:
+                        logger.info("[TOOL] write_article: GDrive watch registered (channel=%s)", watch["channel_id"][:8])
+                    else:
+                        logger.info("[TOOL] write_article: GDrive watch skipped (WEBHOOK_BASE_URL not set)")
+            except Exception as we:
+                logger.warning("[TOOL] write_article: GDrive watch registration failed (%s)", we)
     except Exception as e:
         logger.warning("[TOOL] write_article: Google Doc creation failed (%s), returning content only", e)
 
@@ -601,6 +613,68 @@ def improve_article(
 
 
 # ---------------------------------------------------------------------------
+# Helper: detect and log manual edits (Google Doc vs DB content)
+# ---------------------------------------------------------------------------
+
+def _normalize_for_edit_compare(text: str) -> str:
+    """Strip markdown link syntax and normalize whitespace for comparison."""
+    import re as _re
+    # Remove markdown links: [text](url) → text
+    text = _re.sub(r"\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    # Remove image markdown: ![alt](url)
+    text = _re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    # Normalize whitespace
+    return " ".join(text.split()).strip()
+
+
+def _detect_and_log_manual_edits(article_id: str, db_content: str, gdoc_plain_text: str) -> None:
+    """Compare Google Doc plain text with DB markdown content.
+
+    If they differ significantly (after normalizing markup), log a manual_edit record
+    so the self-improvement loop can analyze what humans are changing.
+    Records are stored in the articles table metadata under 'manual_edits'.
+    """
+    db_normalized = _normalize_for_edit_compare(db_content)
+    doc_normalized = _normalize_for_edit_compare(gdoc_plain_text)
+
+    if not db_normalized or not doc_normalized:
+        return
+    if db_normalized == doc_normalized:
+        return
+
+    # Quick similarity check: if the texts share >90% of words, skip (minor diff / link formatting)
+    db_words = set(db_normalized.lower().split())
+    doc_words = set(doc_normalized.lower().split())
+    if db_words and doc_words:
+        overlap = len(db_words & doc_words) / max(len(db_words), len(doc_words))
+        if overlap > 0.90:
+            return  # Trivial difference (link formatting, minor whitespace, etc.)
+
+    # Significant difference detected — log it
+    try:
+        from src.db import get_client as _get_client
+        from datetime import datetime as _dt, timezone as _tz
+        client = _get_client()
+        row = client.table("articles").select("metadata").eq("id", article_id).single().execute()
+        meta = (row.data or {}).get("metadata") or {}
+        edits = meta.get("manual_edits") or []
+        edits.append({
+            "detected_at": _dt.now(_tz.utc).isoformat(),
+            "db_len": len(db_content),
+            "doc_len": len(gdoc_plain_text),
+            "word_overlap": round(overlap, 3) if db_words and doc_words else None,
+        })
+        meta["manual_edits"] = edits[-20:]  # keep last 20 entries
+        client.table("articles").update({"metadata": meta}).eq("id", article_id).execute()
+        logger.info(
+            "[TOOL] Manual edit detected for article %s (word_overlap=%.2f, db_len=%d, doc_len=%d)",
+            article_id[:8], overlap if db_words and doc_words else 0, len(db_content), len(gdoc_plain_text),
+        )
+    except Exception as e:
+        logger.warning("[TOOL] Could not log manual edit: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Tool: inject_links — surgical link injection via Google Docs API
 # ---------------------------------------------------------------------------
 
@@ -635,6 +709,8 @@ def inject_links(
         doc_result = fetch_doc_content(document_id)
         if doc_result.get("success") and doc_result.get("content"):
             current_text = doc_result["content"]
+            # Detect manual edits: compare Google Doc plain text with DB content plain text.
+            _detect_and_log_manual_edits(article_id, article.get("content", ""), current_text)
 
     # 2. Ask Claude to map each URL → exact anchor phrase from the article text
     import anthropic as _anthropic
@@ -690,10 +766,17 @@ def inject_links(
         result = inject_links_into_doc(document_id, placements)
         placed = result.get("placed", [])
         not_placed = result.get("not_placed", [])
-        # Update DB changelog only; GDoc is source of truth for content
+        # ALSO update DB markdown with [phrase](url) syntax for placed links so they survive
+        # any future doc rewrites (e.g. after approving a hero image or infographic).
+        db_content = article.get("content", "")
+        for p in placed:
+            phrase = (p.get("phrase") or "").strip()
+            url = (p.get("url") or "").strip()
+            if phrase and url and phrase in db_content:
+                db_content = db_content.replace(phrase, f"[{phrase}]({url})", 1)
         update_article(
             article_id,
-            article.get("content", ""),
+            db_content,
             changelog_action=f"Injected {len(placed)} link(s) into Google Doc",
         )
         return {
@@ -825,19 +908,19 @@ def generate_hero_image_tool(
             except Exception as e:
                 logger.warning("[TOOL] generate_hero_image: could not supersede image %s: %s", old_img["id"][:8], e)
 
-    if not previous_image_url and feedback:
+    if not previous_image_url:
         # Fall back to any hero image (including approved ones) for visual reference
         all_images = get_article_images(article_id)
         hero_images = [i for i in all_images if i.get("image_type") == "hero"]
         if hero_images:
             previous_image_url = hero_images[-1].get("url")
 
-    if previous_image_url and feedback:
-        logger.info("[TOOL] generate_hero_image: using previous image as reference for refinement")
+    if previous_image_url:
+        logger.info("[TOOL] generate_hero_image: using previous image as reference (feedback=%r)", bool(feedback))
 
     try:
         img_bytes, prompt_used = generate_hero_image(
-            description, feedback=feedback, previous_image_url=previous_image_url if feedback else None,
+            description, feedback=feedback, previous_image_url=previous_image_url,
         )
     except Exception as e:
         return {"success": False, "error": f"Hero image generation failed: {e}"}
@@ -936,8 +1019,18 @@ def approve_hero_image_tool(
     from src.db import get_client
     get_client().table("articles").update({"hero_image_url": image["url"]}).eq("id", article_id).execute()
 
-    # Sync to Google Doc
-    google_doc_url = _sync_article_to_google_doc(article_id, updated_content)
+    # Sync to Google Doc: surgically insert the image at the top (no full rewrite).
+    google_doc_url = article.get("google_doc_url")
+    if google_doc_url:
+        from src.google_docs import insert_image_into_doc_at_start, _document_id_from_url
+        doc_id = _document_id_from_url(google_doc_url)
+        if doc_id:
+            try:
+                result = insert_image_into_doc_at_start(doc_id, image["url"])
+                google_doc_url = result.get("document_url", google_doc_url)
+                logger.info("[TOOL] approve_hero_image: inserted image surgically into Google Doc")
+            except Exception as e:
+                logger.warning("[TOOL] approve_hero_image: surgical Google Doc insert failed: %s", e)
 
     logger.info("[TOOL] approve_hero_image: done for article %s (content: %d -> %d chars)",
                 article_id[:8], len(original_content), len(updated_content))
@@ -994,22 +1087,22 @@ def generate_infographic_tool(
             except Exception as e:
                 logger.warning("[TOOL] generate_infographic: could not supersede image %s: %s", old_img["id"][:8], e)
 
-    if not previous_image_url and feedback:
+    if not previous_image_url:
         # Fall back to any infographic image (including approved ones) for visual reference
         all_images = get_article_images(article_id)
         infographic_images = [i for i in all_images if i.get("image_type") == "infographic"]
         if infographic_images:
             previous_image_url = infographic_images[-1].get("url")
 
-    if previous_image_url and feedback:
-        logger.info("[TOOL] generate_infographic: using previous image as reference for refinement")
+    if previous_image_url:
+        logger.info("[TOOL] generate_infographic: using previous image as reference (feedback=%r)", bool(feedback))
 
     try:
         img_bytes, prompt_used, analysis = generate_infographic(
             article["content"],
             feedback=feedback,
             infographic_type=infographic_type,
-            previous_image_url=previous_image_url if feedback else None,
+            previous_image_url=previous_image_url,
         )
     except Exception as e:
         return {"success": False, "error": f"Infographic generation failed: {e}"}
@@ -1129,8 +1222,18 @@ def approve_infographic_tool(
     from src.db import get_client
     get_client().table("articles").update({"infographic_url": image["url"]}).eq("id", article_id).execute()
 
-    # Sync to Google Doc
-    google_doc_url = _sync_article_to_google_doc(article_id, updated_content)
+    # Sync to Google Doc: surgically insert image after the target paragraph (no full rewrite).
+    google_doc_url = article.get("google_doc_url")
+    if google_doc_url:
+        from src.google_docs import insert_image_into_doc_after_paragraph, _document_id_from_url
+        doc_id = _document_id_from_url(google_doc_url)
+        if doc_id:
+            try:
+                result = insert_image_into_doc_after_paragraph(doc_id, position_after, image["url"])
+                google_doc_url = result.get("document_url", google_doc_url)
+                logger.info("[TOOL] approve_infographic: inserted image surgically into Google Doc")
+            except Exception as e:
+                logger.warning("[TOOL] approve_infographic: surgical Google Doc insert failed: %s", e)
 
     logger.info("[TOOL] approve_infographic: done for article %s (content: %d -> %d chars)",
                 article_id[:8], len(original_content), len(updated_content))

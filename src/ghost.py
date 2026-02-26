@@ -304,7 +304,7 @@ def create_ghost_draft(
         "authors": [{"email": GHOST_AUTHOR_EMAIL}] if GHOST_AUTHOR_EMAIL else None,
     }
     # Drop None / empty-list values so Ghost applies its own defaults
-    post = {k: v for k, v in post.items() if v is not None and v != []]
+    post = {k: v for k, v in post.items() if v is not None and v != []}
 
     endpoint = f"{GHOST_ADMIN_URL}/ghost/api/admin/posts/"
     headers = {

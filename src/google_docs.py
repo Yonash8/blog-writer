@@ -620,6 +620,140 @@ def update_doc_from_markdown(document_id: str, markdown: str) -> dict:
     return {"document_id": document_id, "document_url": doc_url}
 
 
+def insert_image_into_doc_at_start(document_id: str, image_url: str) -> dict:
+    """Surgically insert a hero image at the very beginning of an existing Google Doc.
+
+    Does NOT rewrite the document — only prepends the image at position 1.
+    Returns {document_id, document_url}.
+    """
+    docs_service = _get_docs_service()
+    img_size = {"height": {"magnitude": 260, "unit": "PT"}, "width": {"magnitude": 468, "unit": "PT"}}
+    # Insert image at position 1 (before all existing content), then add a newline separator.
+    requests = [
+        {"insertInlineImage": {"location": {"index": 1}, "uri": image_url, "objectSize": img_size}},
+        # After the image is at index 1, insert a newline at index 2 to separate it from the title.
+        {"insertText": {"location": {"index": 2}, "text": "\n"}},
+    ]
+    docs_service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
+    return {"document_id": document_id, "document_url": f"https://docs.google.com/document/d/{document_id}/edit"}
+
+
+def insert_image_into_doc_after_paragraph(document_id: str, position_after: str, image_url: str) -> dict:
+    """Surgically insert an infographic after the paragraph matching position_after.
+
+    Does NOT rewrite the document — only inserts the image at the correct position.
+    Falls back to appending at the end if no matching paragraph is found.
+    Returns {document_id, document_url}.
+    """
+    docs_service = _get_docs_service()
+    doc = docs_service.documents().get(documentId=document_id).execute()
+    body_content = doc.get("body", {}).get("content", [])
+
+    snippet = (position_after or "").strip()[:60]
+    insert_idx = None
+    last_end_idx = 1
+
+    for item in body_content:
+        if "endIndex" in item:
+            last_end_idx = item["endIndex"]
+        if "paragraph" not in item:
+            continue
+        para_text = "".join(
+            el.get("textRun", {}).get("content", "")
+            for el in item["paragraph"].get("elements", [])
+        ).replace("\n", " ").strip()
+        if snippet and (snippet in para_text or para_text.startswith(snippet[:30])):
+            insert_idx = item["endIndex"]
+            break
+
+    if insert_idx is None:
+        # Fallback: append at end of document (before the final sentinel index)
+        insert_idx = max(1, last_end_idx - 1)
+
+    img_size = {"height": {"magnitude": 200, "unit": "PT"}, "width": {"magnitude": 300, "unit": "PT"}}
+    requests = [
+        {"insertInlineImage": {"location": {"index": insert_idx}, "uri": image_url, "objectSize": img_size}},
+        {"insertText": {"location": {"index": insert_idx + 1}, "text": "\n"}},
+    ]
+    docs_service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
+    return {"document_id": document_id, "document_url": f"https://docs.google.com/document/d/{document_id}/edit"}
+
+
+def register_gdrive_watch(document_id: str, article_id: str, webhook_base_url: str) -> dict:
+    """Register a Google Drive push notification watch for a document.
+
+    Drive will POST to <webhook_base_url>/webhooks/gdrive-changes when the doc changes.
+    The article_id is passed as the channel token so the webhook can identify which article changed.
+
+    Returns {channel_id, resource_id, expiry_ms}.
+    Raises on failure — caller should handle gracefully.
+
+    Note: The webhook URL domain must be verified in Google Search Console, or you can use a
+    custom domain configured on your Fly.io app via WEBHOOK_BASE_URL env var.
+    """
+    import uuid as _uuid
+
+    channel_id = str(_uuid.uuid4())
+    webhook_url = webhook_base_url.rstrip("/") + "/webhooks/gdrive-changes"
+
+    drive_service = _get_drive_service()
+    body = {
+        "id": channel_id,
+        "type": "web_hook",
+        "address": webhook_url,
+        "token": article_id,  # Returned as X-Goog-Channel-Token in every notification
+        "params": {"ttl": "604800"},  # Max 7 days in seconds
+    }
+    response = drive_service.files().watch(fileId=document_id, body=body).execute()
+    return {
+        "channel_id": response["id"],
+        "resource_id": response["resourceId"],
+        "expiry_ms": int(response.get("expiration", 0)),
+        "document_id": document_id,
+    }
+
+
+def stop_gdrive_watch(channel_id: str, resource_id: str) -> None:
+    """Stop an active Drive push notification watch channel."""
+    drive_service = _get_drive_service()
+    drive_service.channels().stop(body={
+        "id": channel_id,
+        "resourceId": resource_id,
+    }).execute()
+
+
+def ensure_gdrive_watch(document_id: str, article_id: str) -> Optional[dict]:
+    """Ensure a valid GDrive watch exists for a document. Renews if expiring within 24 hours.
+
+    Reads WEBHOOK_BASE_URL from environment. Returns None if not configured.
+    Stores watch info in article metadata via DB helpers.
+    """
+    import os
+    import time as _time
+
+    webhook_base_url = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+    if not webhook_base_url:
+        return None
+
+    from src.db import get_gdrive_watch, set_gdrive_watch
+
+    existing = get_gdrive_watch(article_id)
+    if existing:
+        expiry_ms = existing.get("expiry_ms", 0)
+        # Keep the watch if it still has > 24 hours left
+        if expiry_ms - int(_time.time() * 1000) > 86_400_000:
+            return existing
+        # Expiring soon — stop the old channel and re-register
+        try:
+            stop_gdrive_watch(existing["channel_id"], existing["resource_id"])
+        except Exception:
+            pass  # Best effort; the old channel will expire anyway
+
+    watch_info = register_gdrive_watch(document_id, article_id, webhook_base_url)
+    set_gdrive_watch(article_id, watch_info)
+    return watch_info
+
+
 def create_google_doc_from_article(article_id: str, title: Optional[str] = None, folder_id: Optional[str] = None) -> dict:
     """
     Create a Google Doc from an article in the database.
