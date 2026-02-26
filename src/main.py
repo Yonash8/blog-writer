@@ -44,9 +44,11 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Eager-load all prompts from PromptLayer into memory
+    # Eager-load all prompts, then apply tool description overrides from PromptLayer
     from src.prompts_loader import load_all_prompts
+    from src.agent import apply_tool_description_overrides
     load_all_prompts()
+    apply_tool_description_overrides()
     yield
 
 app = FastAPI(
@@ -824,3 +826,41 @@ async def api_patch_prompts(req: dict = Body(...)):
             upsert_prompt(key, content)
     invalidate_prompts_cache()
     return {"ok": True}
+
+
+@app.post("/api/admin/optimize")
+async def api_run_optimization(req: dict = Body(default={})):
+    """Trigger a self-optimization analysis in the background.
+
+    Optional body: {"window_hours": 24, "max_traces": 200, "dry_run": false}
+    Returns immediately. Results are saved to optimization_sessions and sent via WhatsApp.
+    """
+    from fastapi import BackgroundTasks
+
+    window_hours = int(req.get("window_hours", 24))
+    max_traces   = int(req.get("max_traces", 200))
+    dry_run      = bool(req.get("dry_run", False))
+
+    def _run():
+        import subprocess, sys, os
+        cmd = [sys.executable, "scripts/self_optimize.py", "--window", str(window_hours), "--n", str(max_traces)]
+        if dry_run:
+            cmd.append("--dry-run")
+        cwd = Path(__file__).resolve().parent.parent
+        result = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            logging.getLogger(__name__).error("[OPTIMIZE] Failed: %s", result.stderr[:500])
+        else:
+            logging.getLogger(__name__).info("[OPTIMIZE] Completed. stdout: %s", result.stdout[-500:])
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {"ok": True, "message": f"Optimization started (window={window_hours}h, max_traces={max_traces}, dry_run={dry_run})"}
+
+
+@app.get("/api/admin/optimization-sessions")
+async def api_list_optimization_sessions():
+    """List recent optimization sessions."""
+    from src.db import list_optimization_sessions
+    sessions = list_optimization_sessions(limit=10)
+    return {"sessions": sessions}

@@ -1,0 +1,58 @@
+name: Daily Agent Self-Optimization
+
+on:
+  schedule:
+    - cron: '0 6 * * *'    # 6am UTC daily
+  workflow_dispatch:         # on-demand trigger from GitHub Actions UI
+    inputs:
+      window_hours:
+        description: 'Hours of traces to analyze'
+        required: false
+        default: '24'
+      dry_run:
+        description: 'Dry run (no DB save or WhatsApp notification)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run self-optimizer
+        run: |
+          ARGS="--window ${{ github.event.inputs.window_hours || '24' }} --n 200"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python3 scripts/self_optimize.py $ARGS
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          PROMPTLAYER_API_KEY: ${{ secrets.PROMPTLAYER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GREEN_API_INSTANCE_ID: ${{ secrets.GREEN_API_INSTANCE_ID }}
+          GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
+          WHATSAPP_ALLOWED_CHAT_ID: ${{ secrets.WHATSAPP_ALLOWED_CHAT_ID }}
+          OPTIMIZER_MODEL: ${{ secrets.OPTIMIZER_MODEL || 'claude-opus-4-6' }}
+          PROMPTLAYER_PROMPT_PREFIX: ${{ secrets.PROMPTLAYER_PROMPT_PREFIX || 'blog_writer' }}
+
+      - name: Upload analysis report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimization-report
+          path: data/optimized_prompts.md
+          if-no-files-found: ignore

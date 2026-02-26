@@ -529,3 +529,59 @@ def upsert_prompt(key: str, content: str) -> None:
         {"key": key, "content": content},
         on_conflict="key",
     ).execute()
+
+
+# --- Optimization sessions ---
+
+def create_optimization_session(
+    window_hours: int,
+    trace_count: int,
+    analysis_text: str,
+    action_items: list,
+    channel_user_id: Optional[str] = None,
+) -> dict:
+    """Create a new optimization session with pending status."""
+    client = get_client()
+    pending_ids = [item["id"] for item in action_items if item.get("type") == "prompt_change"]
+    r = client.table("optimization_sessions").insert({
+        "status": "pending",
+        "window_hours": window_hours,
+        "trace_count": trace_count,
+        "analysis_text": analysis_text,
+        "action_items": action_items,
+        "pending_item_ids": pending_ids,
+        "channel_user_id": channel_user_id,
+    }).execute()
+    if not r.data:
+        raise RuntimeError("Failed to create optimization session")
+    return _to_dict(r.data[0])
+
+
+def get_pending_optimization_session(channel_user_id: Optional[str] = None) -> Optional[dict]:
+    """Return the most recent pending optimization session, optionally filtered by user."""
+    client = get_client()
+    q = client.table("optimization_sessions").select("*").eq("status", "pending")
+    if channel_user_id:
+        q = q.eq("channel_user_id", channel_user_id)
+    r = q.order("created_at", desc=True).limit(1).execute()
+    if not r.data:
+        return None
+    return _to_dict(r.data[0])
+
+
+def update_optimization_session(session_id: str, updates: dict) -> Optional[dict]:
+    """Update fields on an optimization session. Returns updated row."""
+    client = get_client()
+    r = client.table("optimization_sessions").update(updates).eq("id", session_id).execute()
+    if not r.data:
+        return None
+    return _to_dict(r.data[0])
+
+
+def list_optimization_sessions(limit: int = 20) -> list[dict]:
+    """List recent optimization sessions."""
+    client = get_client()
+    r = client.table("optimization_sessions").select(
+        "id, created_at, status, window_hours, trace_count, pending_item_ids, channel_user_id, notified_at"
+    ).order("created_at", desc=True).limit(limit).execute()
+    return [_to_dict(s) for s in (r.data or [])]

@@ -22,6 +22,7 @@ _PROMPT_KEYS = (
     "infographic_analysis",
     "infographic_generation",
     "improve_article",
+    "tool_descriptions",   # JSON map: {tool_name: description_string} — editable by optimizer
 )
 
 _pl_cache: dict[str, str] = {}
@@ -117,3 +118,22 @@ def get_all_prompts() -> dict[str, str]:
     for k in _PROMPT_KEYS:
         result[k] = get_prompt(k)
     return result
+
+
+def get_tool_descriptions() -> dict[str, str]:
+    """Return the PromptLayer tool_descriptions map as {tool_name: description}.
+
+    Falls back to empty dict if not set (hardcoded defaults in agent.py are used).
+    The JSON stored in PromptLayer is expected to be: {"tool_name": "description", ...}
+    """
+    import json as _json
+    raw = get_prompt("tool_descriptions")
+    if not raw:
+        return {}
+    try:
+        data = _json.loads(raw)
+        if isinstance(data, dict):
+            return {k: str(v) for k, v in data.items() if k and v}
+    except Exception as e:
+        logger.warning("[PROMPTS] Failed to parse tool_descriptions JSON: %s", e)
+    return {}

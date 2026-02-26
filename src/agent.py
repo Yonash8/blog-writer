@@ -452,7 +452,56 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_optimization",
+            "description": (
+                "View, modify, or deploy the pending self-optimization session. "
+                "Use when the user wants to see, approve, refine, or skip the daily agent analysis. "
+                "Actions: 'list' (show pending items), 'remove_items' (drop specific item IDs before deploy), "
+                "'deploy' (publish approved prompt changes to PromptLayer), 'reject' (discard session)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "remove_items", "deploy", "reject"],
+                        "description": "What to do with the pending optimization session.",
+                    },
+                    "remove_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of action item IDs to remove from the deploy list (use with remove_items or before deploy).",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
 ]
+
+
+def apply_tool_description_overrides() -> None:
+    """Load tool descriptions from PromptLayer and override hardcoded defaults in TOOL_DEFINITIONS.
+
+    Called once at app startup (after load_all_prompts). Safe to call multiple times —
+    re-applies current PromptLayer values. No-op if tool_descriptions is not set in PromptLayer.
+    """
+    from src.prompts_loader import get_tool_descriptions, invalidate_prompts_cache
+    invalidate_prompts_cache()
+    overrides = get_tool_descriptions()
+    if not overrides:
+        logger.debug("[AGENT] No tool_descriptions overrides in PromptLayer — using defaults")
+        return
+    applied = []
+    for tool_def in TOOL_DEFINITIONS:
+        name = tool_def.get("function", {}).get("name", "")
+        if name in overrides:
+            tool_def["function"]["description"] = overrides[name]
+            applied.append(name)
+    logger.info("[AGENT] Applied tool description overrides for: %s", applied)
 
 
 def _openai_tools_to_anthropic() -> list[dict]:
@@ -497,6 +546,7 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         push_to_ghost as _push_to_ghost,
         fetch_promptlayer_execution as _fetch_pl_execution,
         fetch_history as _fetch_history,
+        manage_optimization as _manage_optimization,
     )
 
     # Guard: log a warning for expensive operations so we have an audit trail
@@ -532,6 +582,7 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         "push_to_ghost": _push_to_ghost,
         "fetch_promptlayer_execution": _fetch_pl_execution,
         "fetch_history": _fetch_history,
+        "manage_optimization": _manage_optimization,
     }
     fn = tools.get(name)
     if not fn:
@@ -715,11 +766,36 @@ def run_agent(
             except Exception as ctx_err:
                 logger.warning("[AGENT] Failed to load article context: %s", ctx_err)
 
+            # Inject pending optimization session if one exists
+            try:
+                from src.db import get_pending_optimization_session as _get_pending_opt
+                pending_opt = _get_pending_opt(channel_user_id)
+                if pending_opt:
+                    items = pending_opt.get("action_items") or []
+                    n_items = len(items) if isinstance(items, list) else 0
+                    created = str(pending_opt.get("created_at", ""))[:16]
+                    context_parts.append(
+                        f"## Pending Self-Optimization (Session {str(pending_opt.get('id',''))[:8]})\n"
+                        f"Analysis from {created}. {n_items} action items found.\n"
+                        "Use the `manage_optimization` tool when the user wants to view, approve, modify, or skip it.\n"
+                        "User commands: 'deploy all', 'remove [ids], deploy', 'show optimization', 'skip optimization'."
+                    )
+            except Exception:
+                pass
+
         # Build system prompt: core + playbooks + dynamic context
         context_str = "\n\n".join(context_parts)
         system = get_master_system_prompt()
         if context_str.strip():
             system = f"{system}\n\n{context_str}"
+
+        # Tag the trace with a short hash of the composed system prompt so we
+        # can measure before/after cost across prompt versions.
+        import hashlib as _hashlib
+        from src.observability import get_trace_payload as _get_payload
+        _payload = _get_payload()
+        if _payload is not None:
+            _payload["prompt_version"] = _hashlib.md5(system.encode()).hexdigest()[:8]
 
         # Build Anthropic messages from history
         messages: list[dict] = []

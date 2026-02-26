@@ -82,6 +82,28 @@ def _get_prompts() -> dict[str, str]:
     return prompts
 
 
+def _get_tool_descriptions() -> str:
+    """Extract top-level tool descriptions from TOOL_DEFINITIONS in agent.py.
+
+    Returns a JSON string: {"tool_name": "description", ...}
+    This becomes the initial seed for the PromptLayer tool_descriptions prompt.
+    The optimizer can then rewrite individual descriptions to improve tool invocation.
+    """
+    import json
+    from src.agent import TOOL_DEFINITIONS
+
+    descriptions: dict[str, str] = {}
+    for tool_def in TOOL_DEFINITIONS:
+        fn = tool_def.get("function", {})
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        if name and desc:
+            # Normalise multi-line strings to a single clean string
+            descriptions[name] = " ".join(str(desc).split())
+
+    return json.dumps(descriptions, indent=2, ensure_ascii=False)
+
+
 def main():
     if not PROMPTLAYER_API_KEY:
         print("ERROR: PROMPTLAYER_API_KEY not set in .env")
@@ -91,12 +113,18 @@ def main():
     print("-" * 60)
 
     prompts = _get_prompts()
+
+    # Add tool_descriptions as a special JSON prompt
+    print("\nExtracting tool descriptions from TOOL_DEFINITIONS...")
+    tool_desc_json = _get_tool_descriptions()
+    prompts["tool_descriptions"] = tool_desc_json
+
     print(f"\nFound {len(prompts)} prompts to publish:\n")
 
     ok = 0
     fail = 0
     for key, content in sorted(prompts.items()):
-        if publish(key, content):
+        if publish(key, content, tags=["blog-writer", "seeded"]):
             ok += 1
         else:
             fail += 1
@@ -104,6 +132,8 @@ def main():
     print(f"\nDone: {ok} published, {fail} failed/skipped")
     print(f"\nNOTE: master_system_core and whatsapp_format are managed directly")
     print(f"in PromptLayer — edit them at https://dashboard.promptlayer.com/registry")
+    print(f"\ntool_descriptions is now seeded. The optimizer can rewrite individual")
+    print(f"tool descriptions; changes take effect on the next server restart.")
 
 
 if __name__ == "__main__":

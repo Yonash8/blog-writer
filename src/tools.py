@@ -1385,3 +1385,154 @@ def fetch_history(before_timestamp: str, limit: int = 20, **_) -> dict:
     except Exception as e:
         logger.error("[TOOL] fetch_history error: %s", e)
         return {"error": str(e), "messages": []}
+
+
+def manage_optimization(
+    action: str,
+    remove_ids: Optional[list] = None,
+    **_,
+) -> dict[str, Any]:
+    """View, modify, or deploy the pending self-optimization session.
+
+    Actions:
+    - list: Show action items in the pending session
+    - remove_items: Remove specific item IDs from the pending list before deploying
+    - deploy: Publish all pending prompt_change items to PromptLayer, mark session deployed
+    - reject: Discard the pending session without deploying
+    """
+    from src.db import get_pending_optimization_session, update_optimization_session
+
+    session = get_pending_optimization_session()
+    if not session:
+        return {"success": False, "error": "No pending optimization session found."}
+
+    session_id = session["id"]
+    action_items = session.get("action_items") or []
+    if isinstance(action_items, str):
+        import json as _json
+        action_items = _json.loads(action_items)
+    pending_ids = session.get("pending_item_ids") or [i["id"] for i in action_items if i.get("auto_deployable")]
+
+    if action == "list":
+        deployable = [i for i in action_items if i["id"] in pending_ids]
+        skipped    = [i for i in action_items if i["id"] not in pending_ids]
+        return {
+            "success": True,
+            "session_id": session_id[:8],
+            "created_at": session.get("created_at", "")[:16],
+            "to_deploy": [{"id": i["id"], "goal": i["goal"], "title": i["title"], "impact": i.get("impact", "")} for i in deployable],
+            "skipped":   [{"id": i["id"], "goal": i["goal"], "title": i["title"]} for i in skipped],
+            "note": "Reply with remove_items to remove specific IDs, or deploy to publish.",
+        }
+
+    elif action == "remove_items":
+        ids_to_remove = set(remove_ids or [])
+        updated_ids = [i for i in pending_ids if i not in ids_to_remove]
+        update_optimization_session(session_id, {"pending_item_ids": updated_ids})
+        remaining = [i for i in action_items if i["id"] in updated_ids]
+        return {
+            "success": True,
+            "removed": sorted(ids_to_remove),
+            "remaining_to_deploy": [{"id": i["id"], "title": i["title"]} for i in remaining],
+        }
+
+    elif action == "deploy":
+        import httpx as _httpx
+        import re as _re
+        import os as _os
+
+        PL_API_KEY = _os.environ.get("PROMPTLAYER_API_KEY", "")
+        PL_PREFIX  = _os.getenv("PROMPTLAYER_PROMPT_PREFIX", "blog_writer")
+        PL_BASE    = "https://api.promptlayer.com/rest"
+        analysis   = session.get("analysis_text", "")
+
+        pending_items = [i for i in action_items if i["id"] in pending_ids]
+        prompt_items  = [i for i in pending_items if i.get("type") == "prompt_change"]
+        config_items  = [i for i in pending_items if i.get("type") == "config_change"]
+        deployed_prompts, deployed_configs, failed = [], [], []
+
+        # Deploy prompt changes to PromptLayer
+        for item in prompt_items:
+            prompt_key = item.get("prompt_key")
+            if not prompt_key:
+                continue
+            section_label = f"{prompt_key} (optimized)"
+            pat = rf"#### {_re.escape(section_label)}\n(.*?)(?=\n####|\n###|\Z)"
+            m = _re.search(pat, analysis, _re.DOTALL)
+            if not m:
+                failed.append(f"{prompt_key} (section not found)")
+                continue
+            content = m.group(1).strip()
+            if len(content) < 200:
+                failed.append(f"{prompt_key} (content too short)")
+                continue
+            if prompt_key == "master_system_core" and "{{PLAYBOOKS}}" not in content:
+                failed.append(f"{prompt_key} ({{{{PLAYBOOKS}}}} placeholder missing)")
+                continue
+            input_vars = list(dict.fromkeys(_re.findall(r"\{(\w+)\}", content)))
+            body = {
+                "prompt_name": f"{PL_PREFIX}/{prompt_key}" if PL_PREFIX else prompt_key,
+                "prompt_template": {
+                    "messages": [{"role": "system", "content": content}],
+                    "input_variables": input_vars,
+                },
+                "tags": ["self-optimized"],
+                "api_key": PL_API_KEY,
+            }
+            try:
+                r = _httpx.post(f"{PL_BASE}/publish-prompt-template", json=body, timeout=15.0)
+                r.raise_for_status()
+                data = r.json()
+                if data.get("id") or data.get("success") is not False:
+                    deployed_prompts.append(prompt_key)
+                else:
+                    failed.append(f"{prompt_key} ({data})")
+            except Exception as exc:
+                failed.append(f"{prompt_key} ({exc})")
+
+        # Deploy config changes to agent_config table
+        if config_items:
+            from src.db import upsert_agent_config
+            from src.config import invalidate_config_cache
+            for item in config_items:
+                cfg_key = item.get("config_key")
+                cfg_val = item.get("config_value")
+                if not cfg_key or cfg_val is None:
+                    failed.append(f"config:{cfg_key or '?'} (missing key or value)")
+                    continue
+                try:
+                    upsert_agent_config(cfg_key, str(cfg_val))
+                    deployed_configs.append(f"{cfg_key}={cfg_val!r}")
+                except Exception as exc:
+                    failed.append(f"config:{cfg_key} ({exc})")
+            if deployed_configs:
+                try:
+                    invalidate_config_cache()
+                except Exception:
+                    pass  # non-fatal
+
+        update_optimization_session(session_id, {"status": "deployed"})
+        logger.info(
+            "[TOOL] manage_optimization deploy: prompts=%s configs=%s failed=%s",
+            deployed_prompts, deployed_configs, failed,
+        )
+        notes = []
+        if deployed_prompts:
+            notes.append(f"PromptLayer updated: {', '.join(deployed_prompts)}. Roll back at dashboard.promptlayer.com.")
+        if deployed_configs:
+            notes.append(f"Agent config updated: {', '.join(deployed_configs)}. Takes effect on next request.")
+        if not notes:
+            notes.append("Nothing deployed (all items failed validation).")
+        return {
+            "success": True,
+            "deployed_prompts": deployed_prompts,
+            "deployed_configs": deployed_configs,
+            "failed": failed,
+            "note": " ".join(notes),
+        }
+
+    elif action == "reject":
+        update_optimization_session(session_id, {"status": "rejected"})
+        return {"success": True, "note": "Optimization session discarded."}
+
+    return {"success": False, "error": f"Unknown action: {action!r}. Use list, remove_items, deploy, or reject."}
