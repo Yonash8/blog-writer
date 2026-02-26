@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 # PromptLayer prompt name prefix (e.g. "blog_writer/master_system_core")
 _PL_PREFIX = os.getenv("PROMPTLAYER_PROMPT_PREFIX", "blog_writer")
 
+# Optional prompts: log at debug, not warning (app falls back to defaults)
+_OPTIONAL_PROMPTS = frozenset({"tool_descriptions"})  # JSON overrides only, no model
+
 _PROMPT_KEYS = (
     "master_system_core",
     "playbooks",
@@ -50,7 +53,10 @@ def _fetch_from_promptlayer(key: str) -> Optional[str]:
                 params={"prompt_name": prompt_name},
             )
         if r.status_code != 200:
-            logger.warning("[PROMPTS] PromptLayer returned %s for %r", r.status_code, prompt_name)
+            if key in _OPTIONAL_PROMPTS:
+                logger.debug("[PROMPTS] PromptLayer returned %s for %r (optional)", r.status_code, prompt_name)
+            else:
+                logger.warning("[PROMPTS] PromptLayer returned %s for %r", r.status_code, prompt_name)
             _pl_cache[prompt_name] = ""
             return None
         data = r.json()
@@ -106,7 +112,10 @@ def get_prompt(key: str, default: Optional[str] = None) -> str:
         return val
     if default is not None:
         return default
-    logger.warning("[PROMPTS] No prompt found for %r", key)
+    if key in _OPTIONAL_PROMPTS:
+        logger.debug("[PROMPTS] No prompt found for %r (optional, using defaults)", key)
+    else:
+        logger.warning("[PROMPTS] No prompt found for %r", key)
     return ""
 
 

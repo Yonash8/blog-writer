@@ -123,6 +123,50 @@ def seed_prompt(key: str, metadata: dict) -> bool:
         return False
 
 
+def _get_tool_descriptions_json() -> str:
+    """Extract tool descriptions from TOOL_DEFINITIONS for seeding."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src.agent import TOOL_DEFINITIONS
+    import json
+    descriptions = {}
+    for tool_def in TOOL_DEFINITIONS:
+        fn = tool_def.get("function", {})
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        if name and desc:
+            descriptions[name] = " ".join(str(desc).split())
+    return json.dumps(descriptions, indent=2, ensure_ascii=False)
+
+
+def seed_tool_descriptions() -> bool:
+    """Create tool_descriptions prompt in PL if missing (optional JSON, no model)."""
+    prompt_name = f"{PREFIX}/tool_descriptions" if PREFIX else "tool_descriptions"
+    try:
+        r = httpx.get(PL_GET, headers={"X-API-KEY": PL_API_KEY}, params={"prompt_name": prompt_name}, timeout=10)
+        if r.status_code == 200:
+            print("  OK  tool_descriptions (already exists)")
+            return True
+        # 404 — create it
+        content = _get_tool_descriptions_json()
+        body = {
+            "prompt_name": prompt_name,
+            "prompt_template": {
+                "messages": [{"role": "system", "content": content}],
+                "input_variables": [],
+            },
+            "tags": ["blog-writer"],
+            "api_key": PL_API_KEY,
+        }
+        r2 = httpx.post(PL_PUBLISH, json=body, timeout=15)
+        r2.raise_for_status()
+        if r2.json().get("id") or r2.json().get("success") is not False:
+            print("  OK  tool_descriptions (created)")
+            return True
+    except Exception as e:
+        print(f"  ERR tool_descriptions: {e}")
+    return False
+
+
 def main():
     if not PL_API_KEY:
         print("ERROR: PROMPTLAYER_API_KEY not set in .env")
@@ -136,7 +180,11 @@ def main():
         if seed_prompt(key, meta):
             ok += 1
 
-    print(f"\nDone: {ok}/{len(MODEL_CONFIG)} prompts updated")
+    print("\ntool_descriptions (optional):")
+    if seed_tool_descriptions():
+        ok += 1
+
+    print(f"\nDone: {ok} prompts updated")
     print("Prompts without models (playbooks, whatsapp_format, etc.) are text-only — no model needed.")
 
 
