@@ -56,8 +56,17 @@ def _fetch_from_promptlayer(key: str) -> Optional[str]:
         data = r.json()
         template = data.get("prompt_template") or data.get("template") or {}
 
-        # Cache llm_kwargs (model, temperature, max_tokens, etc.) if present
-        llm_kwargs = template.get("llm_kwargs") or {}
+        # Cache llm_kwargs: from template.llm_kwargs or from metadata.model (PL format)
+        llm_kwargs = dict(template.get("llm_kwargs") or {})
+        if not llm_kwargs:
+            meta = data.get("metadata") or {}
+            model_info = meta.get("model")
+            if isinstance(model_info, dict):
+                name = model_info.get("name")
+                params = model_info.get("parameters") or {}
+                if name:
+                    llm_kwargs["model"] = name
+                    llm_kwargs.update(params)
         if llm_kwargs:
             _llm_kwargs_cache[prompt_name] = llm_kwargs
             logger.debug("[PROMPTS] llm_kwargs for %r: %s", prompt_name, llm_kwargs)

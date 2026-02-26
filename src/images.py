@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Image generation: placement analysis (OpenAI), Imagen/DALL-E, Gemini with references, injection, Supabase upload.
+"""Image generation: placement analysis (Anthropic), Gemini for image generation, injection, Supabase upload.
 
 Includes hero image and infographic generation with style reference support.
 """
@@ -22,11 +22,11 @@ load_dotenv()
 
 from src.config import get_config
 from src.observability import OBSERVABILITY_SAVE_PROMPTS, observe_agent_call
-from src.prompts_loader import get_prompt
+from src.prompts_loader import get_prompt, get_prompt_llm_kwargs
 
 logger = logging.getLogger(__name__)
 
-# Use OpenAI for placement analysis
+# OpenAI used only for DALL-E fallback; placement analysis uses Anthropic
 _openai: OpenAI | None = None
 
 
@@ -104,6 +104,7 @@ def generate_with_gemini_references(
     prompt: str,
     reference_images: list[bytes],
     aspect_ratio: Optional[str] = None,
+    prompt_key: str = "hero_image",
 ) -> bytes:
     """Generate an image using Gemini 2.5 Flash Image with reference images.
 
@@ -141,9 +142,11 @@ def generate_with_gemini_references(
         "[IMAGES] Calling Gemini 2.5 Flash Image with %d refs, prompt: %.120s...",
         len(reference_images[:3]), prompt,
     )
-    model = get_config("image_model_hero", "gemini-2.5-flash-image")
-    # Hero/infographic requires Gemini image model (Nano Banana / Nano Banana Pro)
     GEMINI_IMAGE_MODELS = {"gemini-2.5-flash-image", "gemini-3-pro-image-preview"}
+    model = (
+        get_prompt_llm_kwargs(prompt_key).get("model")
+        or get_config("image_model_hero", "gemini-2.5-flash-image")
+    )
     if model not in GEMINI_IMAGE_MODELS:
         logger.warning(
             "[IMAGES] image_model_hero=%r is not an image-capable model, using gemini-2.5-flash-image",
@@ -272,7 +275,10 @@ def analyze_infographic_placement(article_markdown: str) -> dict[str, Any]:
         raise ValueError("ANTHROPIC_API_KEY not set")
 
     analysis_prompt = get_prompt("infographic_analysis")
-    model = get_config("infographic_analysis_model", "claude-sonnet-4-5")
+    model = (
+        get_prompt_llm_kwargs("infographic_analysis").get("model")
+        or get_config("infographic_analysis_model", "claude-sonnet-4-5")
+    )
     if not model.startswith("claude"):
         logger.warning("[IMAGES] infographic_analysis_model=%r is not an Anthropic model, using claude-sonnet-4-5", model)
         model = "claude-sonnet-4-5"
@@ -390,7 +396,7 @@ def generate_infographic(
         prompt += f"\n\nAdditional instructions: {feedback}"
 
     # Step 4: Generate
-    img_bytes = generate_with_gemini_references(prompt, refs)
+    img_bytes = generate_with_gemini_references(prompt, refs, prompt_key="infographic_generation")
     logger.info("[IMAGES] Infographic generated (%d bytes)", len(img_bytes))
     return img_bytes, prompt, analysis
 
@@ -440,11 +446,22 @@ def inject_infographic_into_markdown(
 
 
 def analyze_image_placements(article_markdown: str, max_images: int = 4) -> list[dict[str, Any]]:
-    """Use configured model to suggest where to place images in the article."""
+    """Use Anthropic to suggest where to place images in the article."""
+    from anthropic import Anthropic as _Anthropic
     placement_prompt = get_prompt("image_placement")
-    model = get_config("image_placement_model", "gpt-4o-mini")
+    model = (
+        get_prompt_llm_kwargs("image_placement").get("model")
+        or get_config("image_placement_model", "claude-haiku-4-5-20251001")
+    )
+    if not model.startswith("claude"):
+        logger.warning(
+            "[IMAGES] image_placement_model=%r is not Anthropic, using claude-haiku-4-5-20251001",
+            model,
+        )
+        model = "claude-haiku-4-5-20251001"
+    max_tokens = get_prompt_llm_kwargs("image_placement").get("max_tokens", 1024)
 
-    client = _get_openai()
+    anthropic_client = _Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     prompt = f"""{placement_prompt}
 
 Article:
@@ -452,12 +469,12 @@ Article:
 {article_markdown[:12000]}
 ---"""
 
-    response = client.chat.completions.create(
+    response = anthropic_client.messages.create(
         model=model,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
     )
-    content = response.choices[0].message.content.strip()
+    content = response.content[0].text.strip()
     # Extract JSON from response (handle markdown code blocks)
     if "```" in content:
         match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", content, re.DOTALL)

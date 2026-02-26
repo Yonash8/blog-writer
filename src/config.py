@@ -23,7 +23,7 @@ _DEFAULTS: dict[str, str] = {
     "image_model_hero": "gemini-2.5-flash-image",
     "infographic_analysis_model": "claude-sonnet-4-20250514",
     "article_write_model": "gpt-4o",
-    "image_placement_model": "gpt-4o-mini",
+    "image_placement_model": "claude-haiku-4-5-20251001",
 }
 
 _cache: dict[str, str] = {}

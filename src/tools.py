@@ -535,7 +535,7 @@ def improve_article(
             return {"success": False, "error": err_str, "retry_hint": retry_hint}
 
     # Anthropic path: edits + link injection via Claude Sonnet
-    from src.prompts_loader import get_prompt
+    from src.prompts_loader import get_prompt, get_prompt_llm_kwargs
     import anthropic as _anthropic
 
     links_section = ""
@@ -556,12 +556,14 @@ def improve_article(
         article=current_content,
     )
 
-    model = "claude-sonnet-4-5"
+    llm_kwargs = get_prompt_llm_kwargs("improve_article")
+    model = llm_kwargs.get("model") or "claude-sonnet-4-5"
+    max_tokens = llm_kwargs.get("max_tokens") or 8192
     start_ts = datetime.now(timezone.utc).isoformat()
     start_perf = time.perf_counter()
     response = anthropic_client.messages.create(
         model=model,
-        max_tokens=8096,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
     end_ts = datetime.now(timezone.utc).isoformat()
