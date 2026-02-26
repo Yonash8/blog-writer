@@ -272,10 +272,10 @@ def analyze_infographic_placement(article_markdown: str) -> dict[str, Any]:
         raise ValueError("ANTHROPIC_API_KEY not set")
 
     analysis_prompt = get_prompt("infographic_analysis")
-    model = get_config("infographic_analysis_model", "claude-sonnet-4-20250514")
+    model = get_config("infographic_analysis_model", "claude-sonnet-4-5")
     if not model.startswith("claude"):
-        logger.warning("[IMAGES] infographic_analysis_model=%r is not an Anthropic model, using claude-sonnet-4-20250514", model)
-        model = "claude-sonnet-4-20250514"
+        logger.warning("[IMAGES] infographic_analysis_model=%r is not an Anthropic model, using claude-sonnet-4-5", model)
+        model = "claude-sonnet-4-5"
 
     client = Anthropic(api_key=api_key)
     prompt = analysis_prompt.format(article=article_markdown[:15000])

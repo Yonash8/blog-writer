@@ -804,19 +804,30 @@ def run_agent(
             except Exception:
                 pass
 
-        # Build system prompt: core + playbooks + dynamic context
+        # Build system prompt: static core (cacheable) + dynamic context (uncached)
         context_str = "\n\n".join(context_parts)
-        system = get_master_system_prompt()
-        if context_str.strip():
-            system = f"{system}\n\n{context_str}"
+        static_system = get_master_system_prompt()
 
-        # Tag the trace with a short hash of the composed system prompt so we
-        # can measure before/after cost across prompt versions.
+        # Tag the trace with a hash of the static system prompt (tracks prompt versions,
+        # independent of per-session context which changes every call).
         import hashlib as _hashlib
         from src.observability import get_trace_payload as _get_payload
         _payload = _get_payload()
         if _payload is not None:
-            _payload["prompt_version"] = _hashlib.md5(system.encode()).hexdigest()[:8]
+            _payload["prompt_version"] = _hashlib.md5(static_system.encode()).hexdigest()[:8]
+
+        # Build system as a list so Anthropic can cache the large static block.
+        # The ephemeral cache_control on the static block saves ~90% on repeat reads.
+        system: list[dict] | str
+        if context_str.strip():
+            system = [
+                {"type": "text", "text": static_system, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": context_str},
+            ]
+        else:
+            system = [
+                {"type": "text", "text": static_system, "cache_control": {"type": "ephemeral"}},
+            ]
 
         # Build Anthropic messages from history
         messages: list[dict] = []
