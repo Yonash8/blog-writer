@@ -1335,8 +1335,8 @@ def push_to_ghost(article_id: str) -> dict[str, Any]:
     Steps:
     1. Fetch article from DB (content + hero_image_url + seo_metadata).
     2. If seo_metadata is absent, run the metadata agent first and save it.
-    3. Call src.ghost.create_ghost_draft() which strips the hero image from the
-       inline markdown, converts MD to HTML, and POSTs to Ghost Admin API.
+    3. Call src.ghost.create_ghost_draft() which uploads hero + inline images,
+       injects SEO metadata, wraps markdown in Lexical markdown card, and POSTs to Ghost.
     4. Return the Ghost editor URL and post ID.
     """
     from src.db import get_article
@@ -1368,6 +1368,24 @@ def push_to_ghost(article_id: str) -> dict[str, Any]:
         metadata = meta_result["metadata"]
 
     hero_url = article.get("hero_image_url")
+    # Fallback: check article_images table for the latest approved hero
+    if not hero_url:
+        try:
+            from src.db import get_client
+            imgs = get_client().table("article_images").select("url,status").eq(
+                "article_id", article_id
+            ).eq("image_type", "hero").eq("status", "approved").order("created_at", desc=True).limit(1).execute()
+            if imgs.data:
+                hero_url = imgs.data[0].get("url") or imgs.data[0].get("image_url")
+                logger.info("[TOOL] push_to_ghost: found hero in article_images: %s", hero_url)
+        except Exception as e:
+            logger.warning("[TOOL] push_to_ghost: could not check article_images for hero: %s", e)
+    if not hero_url:
+        return {
+            "success": False,
+            "error": "No approved hero image found. Generate and approve a hero image before pushing to Ghost.",
+            "retry_hint": "Use generate_hero_image then approve_hero_image, then run push_to_ghost again.",
+        }
     title = article.get("title", "Untitled")
 
     try:

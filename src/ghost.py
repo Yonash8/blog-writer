@@ -156,6 +156,24 @@ def _upload_image_to_ghost(image_url: str, token: str) -> str:
     return resp.json()["images"][0]["url"]
 
 
+def _rehost_images_in_md(md: str, token: str) -> str:
+    """Upload every ![alt](url) image in the markdown to Ghost and replace URLs.
+
+    Images that fail to upload are left with their original URL.
+    """
+    def _replace(match: re.Match) -> str:
+        alt, original_url = match.group(1), match.group(2)
+        try:
+            ghost_url = _upload_image_to_ghost(original_url, token)
+            logger.debug("Ghost image rehosted: %s -> %s", original_url, ghost_url)
+            return f"![{alt}]({ghost_url})"
+        except Exception as e:
+            logger.warning("Ghost image upload failed for %s: %s", original_url, e)
+            return match.group(0)
+
+    return re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', _replace, md)
+
+
 def _rehost_images_in_html(html: str, token: str) -> str:
     """Upload every <img src="..."> in the HTML to Ghost and replace the URLs.
 
@@ -218,20 +236,20 @@ def _md_to_html(md: str) -> str:
     )
 
 
-def _html_to_lexical(html: str) -> str:
-    """Wrap HTML in a Ghost Lexical JSON document using an HTML card.
+def _md_to_lexical(md: str) -> str:
+    """Wrap Markdown in a Ghost Lexical JSON document using a markdown card.
 
-    Ghost 6+ uses Lexical as its editor format.  The simplest way to inject
-    arbitrary HTML is via the built-in ``html`` card node, which renders the
-    HTML verbatim on the front-end.
+    Ghost 6+ uses Lexical as its editor format.  The ``markdown`` card node
+    renders markdown natively with Ghost's own styling, producing much better
+    results than injecting raw HTML via an ``html`` card.
     """
     lexical_doc = {
         "root": {
             "children": [
                 {
-                    "type": "html",
+                    "type": "markdown",
                     "version": 1,
-                    "html": html,
+                    "markdown": md,
                 }
             ],
             "direction": None,
@@ -263,6 +281,7 @@ def create_ghost_draft(
 
     Images (hero + all inline images in the body) are uploaded to Ghost's own
     media storage before the post is created, so Ghost hosts them on its CDN.
+    Hero image upload is required; this call fails if no hero exists or upload fails.
 
     Args:
         title: Fallback title (used when metadata lacks one).
@@ -294,26 +313,27 @@ def create_ghost_draft(
     # Use the explicit hero_image_url first; fall back to extracting from content
     # (the hero is prepended as the first line by inject_hero_into_markdown).
     effective_hero_url = hero_image_url or _extract_hero_url_from_content(content_md)
+    if not effective_hero_url:
+        raise ValueError(
+            "No hero image found. Approve or set a hero image before pushing to Ghost."
+        )
 
-    feature_image: Optional[str] = None
-    if effective_hero_url:
-        try:
-            feature_image = _upload_image_to_ghost(effective_hero_url, token)
-            logger.info("[GHOST] hero image uploaded to Ghost: %s", feature_image)
-        except Exception as e:
-            logger.warning("[GHOST] hero image upload failed, using original URL: %s", e)
-            feature_image = effective_hero_url
+    try:
+        feature_image = _upload_image_to_ghost(effective_hero_url, token)
+        logger.info("[GHOST] hero image uploaded to Ghost: %s", feature_image)
+    except Exception as e:
+        raise RuntimeError(f"Failed to upload hero image to Ghost: {e}") from e
 
     # --- Body content ---
     # Strip the prepended hero line from markdown (it goes to feature_image)
     body_md = _strip_hero_from_md(content_md, effective_hero_url)
-    html_content = _md_to_html(body_md)
-    html_content = _strip_h1_from_html(html_content)
-    # Upload all inline images to Ghost and rewrite their src URLs
-    html_content = _rehost_images_in_html(html_content, token)
-    # Convert to Lexical JSON for Ghost 6+
-    lexical_content = _html_to_lexical(html_content)
-    logger.info("[GHOST] lexical content length: %d chars", len(lexical_content))
+    # Strip the H1 title line (Ghost renders the title separately)
+    body_md = re.sub(r'^#\s+.*\n*', '', body_md, count=1)
+    # Upload inline images to Ghost and rewrite their URLs in the markdown
+    body_md = _rehost_images_in_md(body_md, token)
+    # Convert to Lexical JSON with a markdown card for Ghost 6+
+    lexical_content = _md_to_lexical(body_md)
+    logger.info("[GHOST] lexical markdown content length: %d chars", len(lexical_content))
 
     # --- Build post payload ---
     raw_tags = meta.get("tags", [])
@@ -339,6 +359,7 @@ def create_ghost_draft(
         "tags": ghost_tags,
         "meta_title": _meta_title,
         "meta_description": _meta_desc,
+        "canonical_url": meta.get("canonical_url"),
         "custom_excerpt": _excerpt,
         "codeinjection_head": meta.get("codeinjection_head"),
         "status": "draft",
