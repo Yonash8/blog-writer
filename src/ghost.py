@@ -211,11 +211,37 @@ def _strip_hero_from_md(content: str, hero_url: Optional[str]) -> str:
 
 
 def _md_to_html(md: str) -> str:
-    """Convert markdown to HTML suitable for Ghost's ``html`` content field."""
+    """Convert markdown to HTML suitable for Ghost's content field."""
     return markdown2.markdown(
         md,
         extras=["fenced-code-blocks", "tables", "strike", "header-ids"],
     )
+
+
+def _html_to_lexical(html: str) -> str:
+    """Wrap HTML in a Ghost Lexical JSON document using an HTML card.
+
+    Ghost 6+ uses Lexical as its editor format.  The simplest way to inject
+    arbitrary HTML is via the built-in ``html`` card node, which renders the
+    HTML verbatim on the front-end.
+    """
+    lexical_doc = {
+        "root": {
+            "children": [
+                {
+                    "type": "html",
+                    "version": 1,
+                    "html": html,
+                }
+            ],
+            "direction": None,
+            "format": "",
+            "indent": 0,
+            "type": "root",
+            "version": 1,
+        }
+    }
+    return json.dumps(lexical_doc)
 
 
 def _strip_h1_from_html(html: str) -> str:
@@ -285,6 +311,9 @@ def create_ghost_draft(
     html_content = _strip_h1_from_html(html_content)
     # Upload all inline images to Ghost and rewrite their src URLs
     html_content = _rehost_images_in_html(html_content, token)
+    # Convert to Lexical JSON for Ghost 6+
+    lexical_content = _html_to_lexical(html_content)
+    logger.info("[GHOST] lexical content length: %d chars", len(lexical_content))
 
     # --- Build post payload ---
     raw_tags = meta.get("tags", [])
@@ -305,8 +334,7 @@ def create_ghost_draft(
     post: dict[str, Any] = {
         "title": meta.get("title") or title or "Untitled",
         "slug": meta.get("slug"),
-        "html": html_content,
-        "source_format": "html",  # Tell Ghost 5 the content is HTML, not lexical/mobiledoc
+        "lexical": lexical_content,  # Ghost 6+ uses Lexical format
         "feature_image": feature_image,
         "tags": ghost_tags,
         "meta_title": _meta_title,
