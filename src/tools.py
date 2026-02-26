@@ -1354,7 +1354,12 @@ def push_to_ghost(article_id: str) -> dict[str, Any]:
         return {"success": False, "error": "Article has no content"}
 
     # Ensure SEO metadata exists — generate if absent
+    # Check primary column, then fallback location (metadata.seo)
     metadata = article.get("seo_metadata") or {}
+    if not metadata:
+        article_meta = article.get("metadata") or {}
+        if isinstance(article_meta, dict):
+            metadata = article_meta.get("seo") or {}
     if not metadata:
         emit_status("Generating SEO metadata before pushing to Ghost...")
         meta_result = generate_seo_metadata(article_id)

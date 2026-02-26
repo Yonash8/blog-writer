@@ -44,6 +44,13 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure DB schema is up to date (adds missing columns if needed)
+    from src.db import ensure_articles_schema
+    try:
+        ensure_articles_schema()
+    except Exception as e:
+        logger.warning("Schema migration on startup failed (non-fatal): %s", e)
+
     # Eager-load all prompts, then apply tool description overrides from PromptLayer
     from src.prompts_loader import load_all_prompts
     from src.agent import apply_tool_description_overrides

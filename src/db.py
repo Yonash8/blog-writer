@@ -1,5 +1,6 @@
 """Supabase client and database helpers."""
 
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -9,6 +10,8 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 load_dotenv()
+
+_db_logger = logging.getLogger(__name__)
 
 _url = os.getenv("SUPABASE_URL")
 # Prefer service_role key for backend: bypasses RLS, full DB + storage access
@@ -162,12 +165,33 @@ def set_article_status(article_id: str, status: str, changelog_entry: Optional[s
 
 
 def set_article_seo_metadata(article_id: str, metadata: Any) -> dict:
-    """Store SEO metadata on the article row (seo_metadata JSONB column)."""
+    """Store SEO metadata on the article row (seo_metadata JSONB column).
+
+    Falls back to storing in the ``metadata`` JSONB column if ``seo_metadata``
+    column doesn't exist yet (pre-migration schema).
+    """
     client = get_client()
-    r = client.table("articles").update({"seo_metadata": metadata}).eq("id", article_id).execute()
-    if not r.data or len(r.data) == 0:
-        raise RuntimeError(f"Failed to update seo_metadata for article {article_id}")
-    return _to_dict(r.data[0])
+    try:
+        r = client.table("articles").update({"seo_metadata": metadata}).eq("id", article_id).execute()
+        if r.data and len(r.data) > 0:
+            return _to_dict(r.data[0])
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[DB] seo_metadata column may not exist, falling back to metadata.seo: %s", e
+        )
+    # Fallback: store inside the generic metadata JSONB column
+    try:
+        r = client.table("articles").select("metadata").eq("id", article_id).execute()
+        meta = (r.data[0].get("metadata") or {}) if r.data else {}
+        meta["seo"] = metadata
+        r = client.table("articles").update({"metadata": meta}).eq("id", article_id).execute()
+        if r.data and len(r.data) > 0:
+            return _to_dict(r.data[0])
+    except Exception as e2:
+        import logging
+        logging.getLogger(__name__).error("[DB] Failed to save seo_metadata even via fallback: %s", e2)
+    raise RuntimeError(f"Failed to update seo_metadata for article {article_id}")
 
 
 def set_article_google_doc_url(article_id: str, google_doc_url: str) -> dict:
@@ -625,3 +649,56 @@ def list_optimization_sessions(limit: int = 20) -> list[dict]:
         "id, created_at, status, window_hours, trace_count, pending_item_ids, channel_user_id, notified_at"
     ).order("created_at", desc=True).limit(limit).execute()
     return [_to_dict(s) for s in (r.data or [])]
+
+
+# --- Schema auto-migration ---
+
+_ARTICLES_COLUMNS: list[tuple[str, str]] = [
+    ("seo_metadata", "jsonb"),
+    ("hero_image_url", "text"),
+    ("infographic_url", "text"),
+    ("metadata", "jsonb DEFAULT '{}'::jsonb"),
+]
+
+
+def ensure_articles_schema() -> None:
+    """Add any missing columns to the articles table.
+
+    Uses the ``execute_ddl`` RPC (plpgsql SECURITY DEFINER) to run ALTER TABLE.
+    If that RPC doesn't exist, falls back to ``execute_readonly_sql`` to check
+    columns and logs a warning with the manual SQL to run.
+    """
+    client = get_client()
+
+    # First check which columns already exist
+    try:
+        r = client.rpc("execute_readonly_sql", {
+            "query": (
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'articles'"
+            ),
+        }).execute()
+        existing = {row["column_name"] for row in (r.data or [])}
+    except Exception as e:
+        _db_logger.warning("[DB] Could not check articles schema: %s", e)
+        return
+
+    missing = [(name, typ) for name, typ in _ARTICLES_COLUMNS if name not in existing]
+    if not missing:
+        _db_logger.info("[DB] articles schema OK — all columns present")
+        return
+
+    _db_logger.warning("[DB] Missing articles columns: %s", [m[0] for m in missing])
+
+    # Try DDL via execute_ddl RPC
+    for col_name, col_type in missing:
+        ddl = f"ALTER TABLE articles ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+        try:
+            client.rpc("execute_ddl", {"ddl": ddl}).execute()
+            _db_logger.info("[DB] Added column articles.%s (%s)", col_name, col_type)
+        except Exception as e:
+            _db_logger.warning(
+                "[DB] Auto-migration failed for %s (run manually in Supabase SQL editor): "
+                "%s;\n  Error: %s",
+                col_name, ddl, e,
+            )
