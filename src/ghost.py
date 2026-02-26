@@ -294,6 +294,7 @@ def create_ghost_draft(
         "title": meta.get("title") or title or "Untitled",
         "slug": meta.get("slug"),
         "html": html_content,
+        "source_format": "html",  # Tell Ghost 5 the content is HTML, not lexical/mobiledoc
         "feature_image": feature_image,
         "tags": ghost_tags,
         "meta_title": meta.get("meta_title"),
@@ -314,7 +315,22 @@ def create_ghost_draft(
     }
 
     response = httpx.post(endpoint, json={"posts": [post]}, headers=headers, timeout=30)
-    response.raise_for_status()
+    if response.status_code == 422:
+        error_body = response.text[:1000]
+        logger.error("[GHOST] 422 from Ghost API. Payload keys: %s. Response: %s", list(post.keys()), error_body)
+        # Slug conflicts are the most common 422 cause — retry without slug
+        if "slug" in post and ("Duplicate" in error_body or "slug" in error_body.lower() or "unique" in error_body.lower()):
+            logger.info("[GHOST] Retrying without slug (likely duplicate)")
+            post.pop("slug", None)
+            response = httpx.post(endpoint, json={"posts": [post]}, headers=headers, timeout=30)
+            if not response.is_success:
+                logger.error("[GHOST] Retry also failed %s: %s", response.status_code, response.text[:500])
+                response.raise_for_status()
+        else:
+            response.raise_for_status()
+    elif not response.is_success:
+        logger.error("[GHOST] %s from Ghost API: %s", response.status_code, response.text[:500])
+        response.raise_for_status()
 
     created = response.json()["posts"][0]
     ghost_id = created["id"]
