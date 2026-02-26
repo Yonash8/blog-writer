@@ -1470,12 +1470,21 @@ def manage_optimization(
                 failed.append(f"{prompt_key} ({{{{PLAYBOOKS}}}} placeholder missing)")
                 continue
             input_vars = list(dict.fromkeys(_re.findall(r"\{(\w+)\}", content)))
+            prompt_template: dict = {
+                "messages": [{"role": "system", "content": content}],
+                "input_variables": input_vars,
+            }
+            # Preserve llm_kwargs for master_system_core; apply model_override if specified
+            if prompt_key == "master_system_core":
+                from src.prompts_loader import get_prompt_llm_kwargs
+                existing_kwargs = dict(get_prompt_llm_kwargs("master_system_core"))
+                if item.get("model_override"):
+                    existing_kwargs["model"] = item["model_override"]
+                if existing_kwargs:
+                    prompt_template["llm_kwargs"] = existing_kwargs
             body = {
                 "prompt_name": f"{PL_PREFIX}/{prompt_key}" if PL_PREFIX else prompt_key,
-                "prompt_template": {
-                    "messages": [{"role": "system", "content": content}],
-                    "input_variables": input_vars,
-                },
+                "prompt_template": prompt_template,
                 "tags": ["self-optimized"],
                 "api_key": PL_API_KEY,
             }

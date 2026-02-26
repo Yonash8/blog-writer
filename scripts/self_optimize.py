@@ -213,6 +213,7 @@ Output a JSON array. Each item must have:
 - "impact": estimated impact string
 - "type": "prompt_change" | "code_change" | "config_change" | "investigate"
 - For prompt_change: "prompt_key" (one of the keys above)
+- For prompt_change on master_system_core: optionally "model_override": "claude-sonnet-4-6" to also change the model (stored in llm_kwargs alongside the prompt text in PromptLayer)
 - For config_change: "config_key" (DB key name) and "config_value" (new value as string)
 - "auto_deployable": true if type is prompt_change or config_change (and rewrite/value provided)
 

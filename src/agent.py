@@ -11,15 +11,36 @@ from typing import Any, Callable, Optional
 
 from anthropic import Anthropic
 
+_PL_PREFIX = os.getenv("PROMPTLAYER_PROMPT_PREFIX", "blog_writer")
+
+_PL_ENABLED = False
 try:
     from promptlayer import PromptLayer as _PromptLayer
     _pl = _PromptLayer(api_key=os.getenv("PROMPTLAYER_API_KEY", ""))
     _AnthropicClient = _pl.anthropic.Anthropic
+    _PL_ENABLED = True
 except Exception:
     _AnthropicClient = Anthropic
 
+
+def _pl_track_prompt(request_id: int | str, prompt_name: str) -> None:
+    """Link a PromptLayer request_id to a prompt template. Best-effort, non-blocking."""
+    import httpx as _httpx
+    try:
+        _httpx.post(
+            "https://api.promptlayer.com/rest/track-prompt",
+            json={
+                "request_id": request_id,
+                "prompt_name": prompt_name,
+                "api_key": os.getenv("PROMPTLAYER_API_KEY", ""),
+            },
+            timeout=5.0,
+        )
+    except Exception:
+        pass
+
 from src.config import get_config, get_config_int
-from src.prompts_loader import get_prompt, get_master_system_prompt
+from src.prompts_loader import get_prompt, get_master_system_prompt, get_prompt_llm_kwargs
 from src.observability import (
     get_trace_id,
     init_trace_payload,
@@ -809,9 +830,15 @@ def run_agent(
         # Turn 0 uses Haiku for fast routing / conversational replies.
         # Turn 1+ (after tool execution) uses Sonnet for synthesis and reasoning.
         haiku_model = get_config("agent_haiku_model") or "claude-haiku-4-5-20251001"
-        sonnet_model = get_config("agent_model") or "claude-sonnet-4-5"
+        sonnet_model = (
+            get_prompt_llm_kwargs("master_system_core").get("model")
+            or get_config("agent_model")
+            or "claude-sonnet-4-5"
+        )
         client = _AnthropicClient()
         result_text = ""
+        _pl_tags = [channel or "web", "blog-writer"]
+        _pl_prompt_name = f"{_PL_PREFIX}/master_system_core" if _PL_PREFIX else "master_system_core"
 
         logger.info("[AGENT] Calling Anthropic directly: haiku=%s, sonnet=%s, messages=%d, tools=%d",
                     haiku_model, sonnet_model, len(messages), len(tools))
@@ -819,14 +846,35 @@ def run_agent(
         for turn in range(max_turns):
             current_model = haiku_model if turn == 0 else sonnet_model
             max_tokens = 2048 if turn == 0 else 8096
-            resp = client.messages.create(
-                model=current_model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=messages,
-                tools=tools,
-            )
+            _pl_id = None
+            if _PL_ENABLED:
+                resp, _pl_id = client.messages.create(
+                    model=current_model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                    pl_tags=_pl_tags,
+                    return_pl_id=True,
+                )
+            else:
+                resp = client.messages.create(
+                    model=current_model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                )
             logger.info("[AGENT] model=%s (turn %d)", current_model, turn + 1)
+
+            # Link this request to the master_system_core template version in PL (async)
+            if _pl_id:
+                import threading as _threading
+                _threading.Thread(
+                    target=_pl_track_prompt,
+                    args=(_pl_id, _pl_prompt_name),
+                    daemon=True,
+                ).start()
 
             # Extract text content
             result_text = "\n".join(

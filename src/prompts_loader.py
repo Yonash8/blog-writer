@@ -26,10 +26,15 @@ _PROMPT_KEYS = (
 )
 
 _pl_cache: dict[str, str] = {}
+_llm_kwargs_cache: dict[str, dict] = {}  # prompt_name → llm_kwargs from PL template
 
 
 def _fetch_from_promptlayer(key: str) -> Optional[str]:
-    """Fetch a prompt template from PromptLayer registry. Returns content string or None."""
+    """Fetch a prompt template from PromptLayer registry. Returns content string or None.
+
+    Also populates _llm_kwargs_cache[prompt_name] with any llm_kwargs stored in the
+    template (e.g. {"model": "claude-sonnet-4-5", "max_tokens": 8192}).
+    """
     api_key = os.getenv("PROMPTLAYER_API_KEY")
     if not api_key:
         logger.error("[PROMPTS] PROMPTLAYER_API_KEY not set — cannot load prompts")
@@ -50,6 +55,13 @@ def _fetch_from_promptlayer(key: str) -> Optional[str]:
             return None
         data = r.json()
         template = data.get("prompt_template") or data.get("template") or {}
+
+        # Cache llm_kwargs (model, temperature, max_tokens, etc.) if present
+        llm_kwargs = template.get("llm_kwargs") or {}
+        if llm_kwargs:
+            _llm_kwargs_cache[prompt_name] = llm_kwargs
+            logger.debug("[PROMPTS] llm_kwargs for %r: %s", prompt_name, llm_kwargs)
+
         messages = template.get("messages") or []
         if messages:
             parts = []
@@ -103,13 +115,30 @@ def load_all_prompts() -> None:
     with ThreadPoolExecutor(max_workers=len(keys)) as pool:
         pool.map(_fetch_from_promptlayer, keys)
     loaded = [k for k in keys if _pl_cache.get(f"{_PL_PREFIX}/{k}" if _PL_PREFIX else k)]
+    with_kwargs = [k for k in keys if _llm_kwargs_cache.get(f"{_PL_PREFIX}/{k}" if _PL_PREFIX else k)]
     logger.info("[PROMPTS] Loaded %d/%d prompts at startup: %s", len(loaded), len(keys), loaded)
+    if with_kwargs:
+        logger.info("[PROMPTS] llm_kwargs present for: %s", with_kwargs)
+
+
+def get_prompt_llm_kwargs(key: str) -> dict:
+    """Return cached llm_kwargs for a prompt key (e.g. {"model": "claude-sonnet-4-5"}).
+
+    Returns {} if not set in PromptLayer or if the prompt hasn't been fetched yet.
+    Call load_all_prompts() at startup to ensure the cache is populated.
+    """
+    prompt_name = f"{_PL_PREFIX}/{key}" if _PL_PREFIX else key
+    if prompt_name not in _pl_cache:
+        # Not yet fetched — fetch now to populate both caches
+        _fetch_from_promptlayer(key)
+    return _llm_kwargs_cache.get(prompt_name, {})
 
 
 def invalidate_prompts_cache() -> None:
     """Invalidate cache so next get_prompt reloads from PromptLayer."""
-    global _pl_cache
+    global _pl_cache, _llm_kwargs_cache
     _pl_cache = {}
+    _llm_kwargs_cache = {}
 
 
 def get_all_prompts() -> dict[str, str]:

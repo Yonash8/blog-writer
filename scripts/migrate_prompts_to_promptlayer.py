@@ -29,16 +29,20 @@ PREFIX = os.getenv("PROMPTLAYER_PROMPT_PREFIX", "blog_writer")
 PL_PUBLISH_URL = "https://api.promptlayer.com/rest/publish-prompt-template"
 
 
-def publish(name: str, content: str, tags: list[str] | None = None) -> bool:
+def publish(name: str, content: str, tags: list[str] | None = None,
+            llm_kwargs: dict | None = None) -> bool:
     """Publish a prompt template to PromptLayer. Returns True on success."""
     if not content.strip():
         print(f"  SKIP {name!r} (empty content)")
         return False
 
-    template = {
+    template: dict = {
         "messages": [{"role": "system", "content": content}],
         "input_variables": list(dict.fromkeys(re.findall(r"\{(\w+)\}", content))),
     }
+    if llm_kwargs:
+        template["llm_kwargs"] = llm_kwargs
+
     payload = {
         "prompt_name": f"{PREFIX}/{name}" if PREFIX else name,
         "prompt_template": template,
@@ -121,10 +125,14 @@ def main():
 
     print(f"\nFound {len(prompts)} prompts to publish:\n")
 
+    # llm_kwargs to seed alongside master_system_core prompt text
+    _MASTER_LLM_KWARGS = {"model": "claude-sonnet-4-5", "max_tokens": 8192}
+
     ok = 0
     fail = 0
     for key, content in sorted(prompts.items()):
-        if publish(key, content, tags=["blog-writer", "seeded"]):
+        kw = _MASTER_LLM_KWARGS if key == "master_system_core" else None
+        if publish(key, content, tags=["blog-writer", "seeded"], llm_kwargs=kw):
             ok += 1
         else:
             fail += 1
