@@ -368,16 +368,38 @@ def _read_paragraph_element(element: dict) -> str:
 
 
 def _read_structural_elements(elements: list) -> str:
-    """Recursively extract text from structural elements (paragraphs, tables, TOC)."""
+    """Recursively extract markdown-like text from structural elements.
+
+    Tables are exported as markdown tables so downstream markdown consumers
+    (like Ghost lexical conversion) can render them as native table blocks.
+    """
     parts = []
     for item in elements or []:
         if "paragraph" in item:
             for elem in item["paragraph"].get("elements", []):
                 parts.append(_read_paragraph_element(elem))
         elif "table" in item:
+            rows: list[list[str]] = []
             for row in item["table"].get("tableRows", []):
+                cells: list[str] = []
                 for cell in row.get("tableCells", []):
-                    parts.append(_read_structural_elements(cell.get("content", [])))
+                    cell_text = _read_structural_elements(cell.get("content", []))
+                    cell_text = " ".join(cell_text.replace("\n", " ").split()).strip()
+                    cells.append(cell_text)
+                if cells:
+                    rows.append(cells)
+            if rows:
+                col_count = max(len(r) for r in rows)
+                normalized_rows = [r + ([""] * (col_count - len(r))) for r in rows]
+                header = normalized_rows[0]
+                separator = ["---"] * col_count
+                table_lines = [
+                    "| " + " | ".join(header) + " |",
+                    "| " + " | ".join(separator) + " |",
+                ]
+                for body_row in normalized_rows[1:]:
+                    table_lines.append("| " + " | ".join(body_row) + " |")
+                parts.append("\n" + "\n".join(table_lines) + "\n")
         elif "tableOfContents" in item:
             parts.append(_read_structural_elements(item["tableOfContents"].get("content", [])))
     return "".join(parts)

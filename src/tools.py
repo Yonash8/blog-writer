@@ -1333,13 +1333,15 @@ def push_to_ghost(article_id: str) -> dict[str, Any]:
     """Push the approved article to Ghost CMS as a draft.
 
     Steps:
-    1. Fetch article from DB (content + hero_image_url + seo_metadata).
-    2. If seo_metadata is absent, run the metadata agent first and save it.
-    3. Call src.ghost.create_ghost_draft() which uploads hero + inline images,
-       injects SEO metadata, wraps markdown in Lexical markdown card, and POSTs to Ghost.
-    4. Return the Ghost editor URL and post ID.
+    1. Fetch article from DB (google_doc_url + hero_image_url + seo_metadata).
+    2. Fetch latest content from Google Docs (source of truth) and sync it to DB.
+    3. If seo_metadata is absent, run the metadata agent first and save it.
+    4. Call src.ghost.create_ghost_draft() which uploads hero + inline images,
+       injects SEO metadata, converts markdown to native Lexical blocks, and POSTs to Ghost.
+    5. Return the Ghost editor URL and post ID.
     """
-    from src.db import get_article
+    from src.db import get_article, update_article
+    from src.google_docs import fetch_doc_content
     from src.ghost import create_ghost_draft
     from src.pipeline import emit_status
 
@@ -1349,9 +1351,34 @@ def push_to_ghost(article_id: str) -> dict[str, Any]:
     if not article:
         return {"success": False, "error": f"Article {article_id} not found"}
 
-    content = article.get("content", "")
+    google_doc_url = article.get("google_doc_url")
+    if not google_doc_url:
+        return {
+            "success": False,
+            "error": "No Google Doc is linked to this article. Link a Google Doc before pushing to Ghost.",
+        }
+
+    emit_status("Fetching latest content from Google Doc...")
+    doc_result = fetch_doc_content(google_doc_url)
+    if not doc_result.get("success"):
+        return {
+            "success": False,
+            "error": f"Failed to fetch Google Doc content: {doc_result.get('error', 'unknown error')}",
+            "retry_hint": "Ensure the Google Doc is accessible and try again.",
+        }
+
+    content = (doc_result.get("content") or "").strip()
     if not content:
-        return {"success": False, "error": "Article has no content"}
+        return {
+            "success": False,
+            "error": "Google Doc content is empty. Add content in the doc before pushing to Ghost.",
+        }
+
+    # Source of truth is Google Docs; persist latest doc content into DB before publishing.
+    try:
+        update_article(article_id, content, changelog_action="Synced latest Google Doc content before Ghost push")
+    except Exception as e:
+        return {"success": False, "error": f"Failed to sync Google Doc content to DB: {e}"}
 
     # Ensure SEO metadata exists — generate if absent
     # Check primary column, then fallback location (metadata.seo)

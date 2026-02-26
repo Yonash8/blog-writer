@@ -236,22 +236,17 @@ def _md_to_html(md: str) -> str:
     )
 
 
-def _md_to_lexical(md: str) -> str:
-    """Wrap Markdown in a Ghost Lexical JSON document using a markdown card.
+_FMT_BOLD = 1
+_FMT_ITALIC = 1 << 1
+_FMT_STRIKETHROUGH = 1 << 2
+_FMT_UNDERLINE = 1 << 3
+_FMT_CODE = 1 << 4
 
-    Ghost 6+ uses Lexical as its editor format.  The ``markdown`` card node
-    renders markdown natively with Ghost's own styling, producing much better
-    results than injecting raw HTML via an ``html`` card.
-    """
-    lexical_doc = {
+
+def _lexical_root(children: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
         "root": {
-            "children": [
-                {
-                    "type": "markdown",
-                    "version": 1,
-                    "markdown": md,
-                }
-            ],
+            "children": children,
             "direction": None,
             "format": "",
             "indent": 0,
@@ -259,7 +254,349 @@ def _md_to_lexical(md: str) -> str:
             "version": 1,
         }
     }
-    return json.dumps(lexical_doc)
+
+
+def _lexical_text(text: str, fmt: int = 0) -> dict[str, Any]:
+    return {
+        "detail": 0,
+        "format": fmt,
+        "mode": "normal",
+        "style": "",
+        "text": text,
+        "type": "text",
+        "version": 1,
+    }
+
+
+def _lexical_linebreak() -> dict[str, Any]:
+    return {"type": "linebreak", "version": 1}
+
+
+def _lexical_paragraph(children: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "children": children or [_lexical_text("")],
+        "direction": None,
+        "format": "",
+        "indent": 0,
+        "type": "paragraph",
+        "version": 1,
+    }
+
+
+def _lexical_heading(tag: str, children: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "children": children or [_lexical_text("")],
+        "direction": None,
+        "format": "",
+        "indent": 0,
+        "type": "heading",
+        "tag": tag,
+        "version": 1,
+    }
+
+
+def _lexical_quote(children: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "children": children or [_lexical_paragraph([_lexical_text("")])],
+        "direction": None,
+        "format": "",
+        "indent": 0,
+        "type": "quote",
+        "version": 1,
+    }
+
+
+def _lexical_list(list_type: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "children": items,
+        "direction": None,
+        "format": "",
+        "indent": 0,
+        "listType": list_type,
+        "start": 1,
+        "tag": "ol" if list_type == "number" else "ul",
+        "type": "list",
+        "version": 1,
+    }
+
+
+def _lexical_list_item(children: list[dict[str, Any]], value: int) -> dict[str, Any]:
+    return {
+        "children": children or [_lexical_paragraph([_lexical_text("")])],
+        "direction": None,
+        "format": "",
+        "indent": 0,
+        "type": "listitem",
+        "value": value,
+        "version": 1,
+    }
+
+
+def _lexical_link(url: str, children: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "children": children or [_lexical_text(url)],
+        "direction": None,
+        "format": "",
+        "indent": 0,
+        "rel": "noreferrer",
+        "target": "_blank",
+        "title": None,
+        "type": "link",
+        "url": url,
+        "version": 1,
+    }
+
+
+def _lexical_table_cell(text: str, is_header: bool) -> dict[str, Any]:
+    return {
+        "children": [_lexical_paragraph(_inline_md_to_lexical_nodes(text))],
+        "colSpan": 1,
+        "rowSpan": 1,
+        "headerState": 2 if is_header else 0,
+        "type": "tablecell",
+        "version": 1,
+    }
+
+
+def _lexical_table_row(values: list[str], is_header: bool) -> dict[str, Any]:
+    return {
+        "children": [_lexical_table_cell(v, is_header=is_header) for v in values],
+        "type": "tablerow",
+        "version": 1,
+    }
+
+
+def _lexical_table(headers: list[str], rows: list[list[str]]) -> dict[str, Any]:
+    return {
+        "children": [
+            _lexical_table_row(headers, is_header=True),
+            *[_lexical_table_row(r, is_header=False) for r in rows],
+        ],
+        "type": "table",
+        "version": 1,
+    }
+
+
+_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*|__([^_]+)__")
+_ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)|(?<!_)_([^_\n]+)_(?!_)")
+_CODE_RE = re.compile(r"`([^`\n]+)`")
+
+
+def _inline_md_to_lexical_nodes(text: str, fmt: int = 0) -> list[dict[str, Any]]:
+    """Parse basic inline markdown into Lexical text/link nodes."""
+    nodes: list[dict[str, Any]] = []
+    i = 0
+    while i < len(text):
+        candidates: list[tuple[int, str, re.Match[str]]] = []
+        for kind, pat in (("link", _LINK_RE), ("bold", _BOLD_RE), ("italic", _ITALIC_RE), ("code", _CODE_RE)):
+            m = pat.search(text, i)
+            if m:
+                candidates.append((m.start(), kind, m))
+        if not candidates:
+            tail = text[i:]
+            if tail:
+                nodes.append(_lexical_text(tail, fmt))
+            break
+        candidates.sort(key=lambda x: x[0])
+        start, kind, m = candidates[0]
+        if start > i:
+            nodes.append(_lexical_text(text[i:start], fmt))
+        if kind == "link":
+            label = m.group(1)
+            url = m.group(2).strip()
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            nodes.append(_lexical_link(url, _inline_md_to_lexical_nodes(label, fmt)))
+        elif kind == "bold":
+            inner = m.group(1) or m.group(2) or ""
+            nodes.extend(_inline_md_to_lexical_nodes(inner, fmt | _FMT_BOLD))
+        elif kind == "italic":
+            inner = m.group(1) or m.group(2) or ""
+            nodes.extend(_inline_md_to_lexical_nodes(inner, fmt | _FMT_ITALIC))
+        else:  # code
+            inner = m.group(1) or ""
+            nodes.append(_lexical_text(inner, fmt | _FMT_CODE))
+        i = m.end()
+    return nodes
+
+
+_IMAGE_LINE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_UL_ITEM_RE = re.compile(r"^\s*[-*+]\s+(.+)$")
+_OL_ITEM_RE = re.compile(r"^\s*\d+\.\s+(.+)$")
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+
+
+def _split_table_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _looks_like_table_start(lines: list[str], i: int) -> bool:
+    if i + 1 >= len(lines):
+        return False
+    return ("|" in lines[i]) and bool(_TABLE_SEPARATOR_RE.match(lines[i + 1].strip()))
+
+
+def _parse_md_table(lines: list[str], i: int) -> tuple[dict[str, Any], int]:
+    header_cells = _split_table_row(lines[i])
+    if not header_cells or all(c == "" for c in header_cells):
+        raise ValueError("Malformed markdown table: missing header row")
+    col_count = len(header_cells)
+    j = i + 1
+    if not _TABLE_SEPARATOR_RE.match(lines[j].strip()):
+        raise ValueError("Malformed markdown table: missing separator row")
+    j += 1
+    body_rows: list[list[str]] = []
+    while j < len(lines):
+        line = lines[j].rstrip()
+        if not line.strip():
+            break
+        if "|" not in line:
+            break
+        row = _split_table_row(line)
+        if len(row) != col_count:
+            raise ValueError(
+                f"Malformed markdown table: row has {len(row)} columns, expected {col_count}"
+            )
+        body_rows.append(row)
+        j += 1
+    return {"type": "table", "headers": header_cells, "rows": body_rows}, j
+
+
+def _parse_markdown_blocks(md: str) -> list[dict[str, Any]]:
+    lines = md.splitlines()
+    blocks: list[dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped:
+            i += 1
+            continue
+
+        if stripped.startswith("```"):
+            fence = stripped[:3]
+            i += 1
+            code_lines: list[str] = []
+            while i < len(lines) and not lines[i].strip().startswith(fence):
+                code_lines.append(lines[i])
+                i += 1
+            if i >= len(lines):
+                raise ValueError("Unclosed fenced code block in markdown content")
+            i += 1
+            blocks.append({"type": "code", "text": "\n".join(code_lines)})
+            continue
+
+        if _looks_like_table_start(lines, i):
+            table_block, i = _parse_md_table(lines, i)
+            blocks.append(table_block)
+            continue
+
+        m_image = _IMAGE_LINE_RE.match(stripped)
+        if m_image:
+            blocks.append({"type": "image", "alt": m_image.group(1), "url": m_image.group(2)})
+            i += 1
+            continue
+
+        m_heading = _HEADING_RE.match(stripped)
+        if m_heading:
+            level = min(len(m_heading.group(1)), 6)
+            blocks.append({"type": "heading", "level": level, "text": m_heading.group(2).strip()})
+            i += 1
+            continue
+
+        if stripped.startswith(">"):
+            q_lines: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                q_lines.append(lines[i].strip()[1:].lstrip())
+                i += 1
+            blocks.append({"type": "quote", "text": "\n".join(q_lines).strip()})
+            continue
+
+        m_ul = _UL_ITEM_RE.match(line)
+        m_ol = _OL_ITEM_RE.match(line)
+        if m_ul or m_ol:
+            list_type = "bullet" if m_ul else "number"
+            items: list[str] = []
+            while i < len(lines):
+                cur = lines[i]
+                mm = _UL_ITEM_RE.match(cur) if list_type == "bullet" else _OL_ITEM_RE.match(cur)
+                if not mm:
+                    break
+                items.append(mm.group(1).strip())
+                i += 1
+            blocks.append({"type": "list", "list_type": list_type, "items": items})
+            continue
+
+        para_lines: list[str] = []
+        while i < len(lines):
+            cur = lines[i]
+            cur_s = cur.strip()
+            if not cur_s:
+                break
+            if (
+                cur_s.startswith("```")
+                or _looks_like_table_start(lines, i)
+                or _IMAGE_LINE_RE.match(cur_s)
+                or _HEADING_RE.match(cur_s)
+                or cur_s.startswith(">")
+                or _UL_ITEM_RE.match(cur)
+                or _OL_ITEM_RE.match(cur)
+            ):
+                break
+            para_lines.append(cur_s)
+            i += 1
+        blocks.append({"type": "paragraph", "text": " ".join(para_lines).strip()})
+    return blocks
+
+
+def _md_to_lexical(md: str) -> str:
+    """Convert markdown to native Ghost Lexical blocks (no markdown-card box)."""
+    blocks = _parse_markdown_blocks(md)
+    children: list[dict[str, Any]] = []
+    for block in blocks:
+        t = block["type"]
+        if t == "paragraph":
+            children.append(_lexical_paragraph(_inline_md_to_lexical_nodes(block["text"])))
+        elif t == "heading":
+            tag = f"h{block['level']}"
+            children.append(_lexical_heading(tag, _inline_md_to_lexical_nodes(block["text"])))
+        elif t == "quote":
+            children.append(_lexical_quote([_lexical_paragraph(_inline_md_to_lexical_nodes(block["text"]))]))
+        elif t == "code":
+            code_text = block["text"]
+            code_children: list[dict[str, Any]] = []
+            for idx, line in enumerate(code_text.split("\n")):
+                if idx > 0:
+                    code_children.append(_lexical_linebreak())
+                code_children.append(_lexical_text(line, _FMT_CODE))
+            children.append(_lexical_paragraph(code_children))
+        elif t == "list":
+            list_items: list[dict[str, Any]] = []
+            for idx, item in enumerate(block["items"], 1):
+                list_items.append(_lexical_list_item([_lexical_paragraph(_inline_md_to_lexical_nodes(item))], value=idx))
+            children.append(_lexical_list(block["list_type"], list_items))
+        elif t == "table":
+            children.append(_lexical_table(block["headers"], block["rows"]))
+        elif t == "image":
+            # Use an HTML card node for image rendering while keeping main content native Lexical.
+            alt = block["alt"].replace('"', "&quot;")
+            src = block["url"].replace('"', "&quot;")
+            children.append(
+                {
+                    "type": "html",
+                    "version": 1,
+                    "html": f'<img src="{src}" alt="{alt}" />',
+                }
+            )
+
+    return json.dumps(_lexical_root(children))
 
 
 def _strip_h1_from_html(html: str) -> str:
@@ -331,9 +668,9 @@ def create_ghost_draft(
     body_md = re.sub(r'^#\s+.*\n*', '', body_md, count=1)
     # Upload inline images to Ghost and rewrite their URLs in the markdown
     body_md = _rehost_images_in_md(body_md, token)
-    # Convert to Lexical JSON with a markdown card for Ghost 6+
+    # Convert to native Lexical JSON blocks for Ghost 6+
     lexical_content = _md_to_lexical(body_md)
-    logger.info("[GHOST] lexical markdown content length: %d chars", len(lexical_content))
+    logger.info("[GHOST] lexical content length: %d chars", len(lexical_content))
 
     # --- Build post payload ---
     raw_tags = meta.get("tags", [])
