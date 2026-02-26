@@ -290,6 +290,18 @@ def create_ghost_draft(
     raw_tags = meta.get("tags", [])
     ghost_tags = [{"name": t} for t in raw_tags] if isinstance(raw_tags, list) else []
 
+    # Ghost field length limits (422 if exceeded)
+    _excerpt = meta.get("excerpt")
+    if _excerpt and len(_excerpt) > 300:
+        logger.warning("[GHOST] custom_excerpt too long (%d chars), truncating to 300", len(_excerpt))
+        _excerpt = _excerpt[:297] + "..."
+    _meta_title = meta.get("meta_title")
+    if _meta_title and len(_meta_title) > 300:
+        _meta_title = _meta_title[:297] + "..."
+    _meta_desc = meta.get("meta_description")
+    if _meta_desc and len(_meta_desc) > 500:
+        _meta_desc = _meta_desc[:497] + "..."
+
     post: dict[str, Any] = {
         "title": meta.get("title") or title or "Untitled",
         "slug": meta.get("slug"),
@@ -297,9 +309,9 @@ def create_ghost_draft(
         "source_format": "html",  # Tell Ghost 5 the content is HTML, not lexical/mobiledoc
         "feature_image": feature_image,
         "tags": ghost_tags,
-        "meta_title": meta.get("meta_title"),
-        "meta_description": meta.get("meta_description"),
-        "custom_excerpt": meta.get("excerpt"),
+        "meta_title": _meta_title,
+        "meta_description": _meta_desc,
+        "custom_excerpt": _excerpt,
         "codeinjection_head": meta.get("codeinjection_head"),
         "status": "draft",
         "authors": [{"email": GHOST_AUTHOR_EMAIL}] if GHOST_AUTHOR_EMAIL else None,
