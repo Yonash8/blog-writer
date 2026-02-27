@@ -11,34 +11,6 @@ from typing import Any, Callable, Optional
 
 from anthropic import Anthropic
 
-_PL_PREFIX = os.getenv("PROMPTLAYER_PROMPT_PREFIX", "blog_writer")
-
-_PL_ENABLED = False
-try:
-    from promptlayer import PromptLayer as _PromptLayer
-    _pl = _PromptLayer(api_key=os.getenv("PROMPTLAYER_API_KEY", ""))
-    _AnthropicClient = _pl.anthropic.Anthropic
-    _PL_ENABLED = True
-except Exception:
-    _AnthropicClient = Anthropic
-
-
-def _pl_track_prompt(request_id: int | str, prompt_name: str) -> None:
-    """Link a PromptLayer request_id to a prompt template. Best-effort, non-blocking."""
-    import httpx as _httpx
-    try:
-        _httpx.post(
-            "https://api.promptlayer.com/rest/track-prompt",
-            json={
-                "request_id": request_id,
-                "prompt_name": prompt_name,
-                "api_key": os.getenv("PROMPTLAYER_API_KEY", ""),
-            },
-            timeout=5.0,
-        )
-    except Exception:
-        pass
-
 from src.config import get_config, get_config_int
 from src.prompts_loader import get_prompt, get_master_system_prompt, get_prompt_llm_kwargs
 from src.observability import (
@@ -199,14 +171,14 @@ TOOL_DEFINITIONS = [
             "name": "write_article",
             "description": (
                 "Full article pipeline: PromptLayer SEO writer (research is handled inside PromptLayer). "
-                "Optionally enriches with Tavily web sources — ASK the user first before setting include_tavily=True. "
+                "Optionally enriches with Tavily web sources when useful. "
                 "Auto-saves to DB and creates Google Doc. Returns article_id, content, google_doc_url, metadata."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string", "description": "The topic to write about"},
-                    "include_tavily": {"type": "boolean", "description": "Include Tavily web source enrichment (default False). Ask the user first.", "default": False},
+                    "include_tavily": {"type": "boolean", "description": "Include Tavily web source enrichment (default False).", "default": False},
                     "tavily_max_results": {"type": "integer", "description": "Max Tavily sources (5-20)", "default": 20},
                     "changelog_entry": {"type": "string", "description": "Brief changelog entry, e.g. 'Created draft on topic X'"},
                 },
@@ -540,6 +512,26 @@ def _openai_tools_to_anthropic() -> list[dict]:
     return tools
 
 
+# Action-oriented requests are more sensitive to routing misses.
+# Prefer Sonnet on turn 0 for these, keep Haiku for simple conversational turns.
+_ACTION_FIRST_PAT = re.compile(
+    r"\b("
+    r"write|create|generate|improve|edit|revise|add|inject|approve|publish|push|"
+    r"ghost|seo|metadata|image|hero|infographic|optimi[sz]e|deploy|run"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _should_use_sonnet_first_turn(user_message: str) -> bool:
+    text = (user_message or "").strip()
+    if not text:
+        return False
+    if len(text) <= 16 and text.lower() in {"ok", "yes", "no", "thanks", "thx", "why", "how"}:
+        return False
+    return bool(_ACTION_FIRST_PAT.search(text))
+
+
 # ---------------------------------------------------------------------------
 # Tool execution
 # ---------------------------------------------------------------------------
@@ -728,14 +720,13 @@ def run_agent(
             if wp:
                 context_parts.append(wp)
 
-        if os.getenv("GHOST_ADMIN_URL"):
-            context_parts.append(
-                "## Ghost Publishing\n"
-                "When the user asks to push, publish, send, or create a draft in Ghost "
-                "(e.g. 'push to ghost', 'send to ghost', 'ghost draft', 'publish to ghost'), "
-                "ALWAYS call the `push_to_ghost` tool immediately with the current article_id. "
-                "Do NOT narrate or describe the action — just call the tool."
-            )
+        context_parts.append(
+            "## Operating Mode\n"
+            "Be autonomous and conversational. Infer intent from context and execute tools when intent is clear. "
+            "Avoid unnecessary clarification loops. For short follow-ups and pronouns, resolve from current context/history. "
+            "If multiple actions are clearly requested, do them in sequence without asking for step-by-step confirmation. "
+            "Only ask a brief clarifying question when proceeding could target the wrong resource or create irreversible side effects."
+        )
 
         # Fetch article context + history in parallel
         history_limit = get_config_int("agent_history_limit", 10)
@@ -762,7 +753,9 @@ def run_agent(
                             "always use the google_docs tool (action='fetch') to read the current version. "
                             "Use the database only for metadata (status, title, article_id, etc.)."
                         )
-                    ctx += "\nWhen the user says \"the article\", \"it\", or refers to the draft - use this article_id. Do NOT ask for article_id."
+                    ctx += (
+                        "\nWhen the user says \"the article\" or \"it\", treat this as the default target article unless the user explicitly switches."
+                    )
                     try:
                         pending = get_pending_article_images(latest["id"])
                         if pending:
@@ -838,54 +831,32 @@ def run_agent(
         messages.append({"role": "user", "content": user_message.strip() or "(no message)"})
 
         tools = _openai_tools_to_anthropic()
-        # Turn 0 uses Haiku for fast routing / conversational replies.
-        # Turn 1+ (after tool execution) uses Sonnet for synthesis and reasoning.
+        # Default: Haiku for quick turn-0 routing, Sonnet after tool execution.
+        # For explicit action requests, start with Sonnet to reduce routing/context misses.
         haiku_model = get_config("agent_haiku_model") or "claude-haiku-4-5-20251001"
         sonnet_model = (
             get_prompt_llm_kwargs("master_system_core").get("model")
             or get_config("agent_model")
             or "claude-sonnet-4-5"
         )
-        client = _AnthropicClient()
+        first_turn_model = sonnet_model if _should_use_sonnet_first_turn(user_message) else haiku_model
+        client = Anthropic()
         result_text = ""
-        _pl_tags = [channel or "web", "blog-writer"]
-        _pl_prompt_name = f"{_PL_PREFIX}/master_system_core" if _PL_PREFIX else "master_system_core"
 
         logger.info("[AGENT] Calling Anthropic directly: haiku=%s, sonnet=%s, messages=%d, tools=%d",
                     haiku_model, sonnet_model, len(messages), len(tools))
 
         for turn in range(max_turns):
-            current_model = haiku_model if turn == 0 else sonnet_model
+            current_model = first_turn_model if turn == 0 else sonnet_model
             max_tokens = 2048 if turn == 0 else 8096
-            _pl_id = None
-            if _PL_ENABLED:
-                resp, _pl_id = client.messages.create(
-                    model=current_model,
-                    max_tokens=max_tokens,
-                    system=system,
-                    messages=messages,
-                    tools=tools,
-                    pl_tags=_pl_tags,
-                    return_pl_id=True,
-                )
-            else:
-                resp = client.messages.create(
-                    model=current_model,
-                    max_tokens=max_tokens,
-                    system=system,
-                    messages=messages,
-                    tools=tools,
-                )
+            resp = client.messages.create(
+                model=current_model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                tools=tools,
+            )
             logger.info("[AGENT] model=%s (turn %d)", current_model, turn + 1)
-
-            # Link this request to the master_system_core template version in PL (async)
-            if _pl_id:
-                import threading as _threading
-                _threading.Thread(
-                    target=_pl_track_prompt,
-                    args=(_pl_id, _pl_prompt_name),
-                    daemon=True,
-                ).start()
 
             # Extract text content
             result_text = "\n".join(
