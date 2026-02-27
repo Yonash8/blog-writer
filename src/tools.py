@@ -6,9 +6,10 @@ General-purpose tools:
   - google_docs_tool: Create/update Google Docs
   - web_search: Web search via Tavily
   - send_image_tool: Send an image to the user (WhatsApp media or web)
+  - send_interactive_tool: Send WhatsApp buttons or polls
 
 Pipeline tools (complex orchestration):
-  - write_article: Deep research + Tavily + PromptLayer → article
+  - write_article: PromptLayer SEO → article
   - improve_article: LLM-based article revision
   - generate_and_place_images: AI image generation + placement
   - generate_hero_image_tool / approve_hero_image_tool
@@ -17,6 +18,7 @@ Pipeline tools (complex orchestration):
 
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -300,8 +302,74 @@ def send_image_tool(
             logger.warning("[TOOL] send_image: WhatsApp media failed (%s), returning URL", e)
             return {"success": True, "sent_as": "url_fallback", "image_url": secure_url, "note": f"Media send failed: {e}. Include the URL in your text reply instead."}
 
+    # Terminal/dev: no inline display—print URL so user can open in browser
+    if channel == "dev":
+        cap = f" — {caption}" if caption else ""
+        print(f"\n  [IMAGE{cap}]\n  {secure_url}\n", file=sys.stderr)
+        return {"success": True, "sent_as": "url", "image_url": secure_url, "displayed_in_terminal": True}
+
     # Web or unknown channel: return the URL for the frontend to display
     return {"success": True, "sent_as": "url", "image_url": secure_url}
+
+
+def send_interactive_tool(
+    mode: str,
+    body: str,
+    choices: list[str],
+    header: Optional[str] = None,
+    footer: Optional[str] = None,
+    multiple_answers: bool = False,
+) -> dict[str, Any]:
+    """Send WhatsApp interactive controls (buttons or poll) with text fallback.
+
+    mode:
+      - buttons: up to 3 choices
+      - poll: 2-12 choices
+    """
+    channel = _current_channel.get()
+    chat_id = _current_chat_id.get()
+    if not choices:
+        return {"success": False, "error": "choices must include at least one option"}
+
+    # Non-WhatsApp channels: return a plain fallback text so agent can still answer.
+    if channel != "whatsapp" or not chat_id:
+        opts = "\n".join(f"{i+1}) {c}" for i, c in enumerate(choices))
+        return {"success": True, "sent_as": "text_fallback", "fallback_text": f"{body}\n\n{opts}"}
+
+    try:
+        from src.channels.whatsapp import send_interactive_buttons_reply, send_poll_message
+        clean_mode = (mode or "").strip().lower()
+        cleaned_choices = [str(c).strip() for c in choices if str(c).strip()]
+        if clean_mode == "buttons":
+            if len(cleaned_choices) > 3:
+                return {"success": False, "error": "buttons mode supports max 3 choices"}
+            buttons = [{"buttonId": f"opt_{i+1}", "buttonText": c} for i, c in enumerate(cleaned_choices)]
+            result = send_interactive_buttons_reply(
+                chat_id=chat_id,
+                body=body,
+                buttons=buttons,
+                header=header,
+                footer=footer,
+            )
+            return {"success": True, "sent_as": "whatsapp_buttons", "idMessage": result.get("idMessage")}
+        if clean_mode == "poll":
+            result = send_poll_message(
+                chat_id=chat_id,
+                message=body,
+                options=cleaned_choices,
+                multiple_answers=multiple_answers,
+            )
+            return {"success": True, "sent_as": "whatsapp_poll", "idMessage": result.get("idMessage")}
+        return {"success": False, "error": "Unknown mode. Use 'buttons' or 'poll'."}
+    except Exception as e:
+        logger.warning("[TOOL] send_interactive failed (%s), returning fallback text", e)
+        opts = "\n".join(f"{i+1}) {c}" for i, c in enumerate(choices))
+        return {
+            "success": True,
+            "sent_as": "text_fallback",
+            "fallback_text": f"{body}\n\n{opts}\n\nReply with the option number.",
+            "note": f"Interactive send failed: {e}",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -310,13 +378,12 @@ def send_image_tool(
 
 def write_article(
     topic: str,
+    approved: bool = False,
     channel: Optional[str] = None,
     channel_user_id: Optional[str] = None,
-    include_tavily: bool = True,
-    tavily_max_results: int = 20,
     changelog_entry: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Full pipeline: deep research + Tavily + PromptLayer SEO → save to DB → create Google Doc.
+    """Full pipeline: PromptLayer SEO → save to DB → create Google Doc.
 
     Returns dict with article_id, content, google_doc_url.
     """
@@ -326,18 +393,30 @@ def write_article(
     if not channel_user_id:
         channel_user_id = _current_chat_id.get(None)
 
-    logger.info("[TOOL] write_article: topic=%r, channel=%s, channel_user_id=%s, include_tavily=%s, tavily_max_results=%d",
-                topic, channel, channel_user_id, include_tavily, tavily_max_results)
+    logger.info(
+        "[TOOL] write_article: topic=%r, approved=%s, channel=%s, channel_user_id=%s",
+        topic, approved, channel, channel_user_id,
+    )
     from src.pipeline import write_article as _write
     from src.db import create_article, add_message, get_or_create_topic_for_article, set_article_google_doc_url
+    from src.article_memory import summarize_with_sonnet, format_summary_memory
 
     if not channel or not channel_user_id:
         return {"success": False, "error": "channel and channel_user_id are required", "retry_hint": "This should be set automatically by the agent."}
 
+    if not approved:
+        return {
+            "success": False,
+            "error": "Explicit approval required before writing the article.",
+            "needs_approval": True,
+            "approval_instruction": "Ask the user for explicit approval, then call write_article again with approved=true.",
+            "retry_hint": "Wait for a clear yes/approve and retry with approved=true.",
+        }
+
     from src.pipeline import emit_status
 
     try:
-        pl_result = _write(topic, include_tavily=include_tavily, tavily_max_results=tavily_max_results)
+        pl_result = _write(topic)
     except Exception as e:
         from src.pipeline import _parse_promptlayer_error_for_user
         parsed = _parse_promptlayer_error_for_user(str(e))
@@ -389,7 +468,15 @@ def write_article(
         logger.warning("[TOOL] write_article: Google Doc creation failed (%s), returning content only", e)
 
     add_message(channel, channel_user_id, "user", f"Write an article about: {topic}")
-    add_message(channel, channel_user_id, "assistant", f"[Article created]\n\n{content}")
+    summary_text = summarize_with_sonnet(topic, content)
+    memory_summary = format_summary_memory(
+        title=topic,
+        article_id=article["id"],
+        google_doc_url=google_doc_url,
+        content=content,
+        summary=summary_text,
+    )
+    add_message(channel, channel_user_id, "assistant", memory_summary)
     logger.info("[TOOL] write_article DONE: article_id=%s, content_len=%d", article["id"], len(content))
     return {
         "article_id": article["id"],
@@ -1540,6 +1627,34 @@ def fetch_history(before_timestamp: str, limit: int = 20, **_) -> dict:
     except Exception as e:
         logger.error("[TOOL] fetch_history error: %s", e)
         return {"error": str(e), "messages": []}
+
+
+def clean_memory_tool(**_) -> dict[str, Any]:
+    """Clear the conversation cache for the current user. Use when the user asks to forget, reset, or clear the chat history."""
+    from src.tools import _current_channel, _current_chat_id
+    from src.message_cache import clear_for_user, clear_current_mission
+    from src.db import delete_messages_for_user
+
+    channel = _current_channel.get(None)
+    channel_user_id = _current_chat_id.get(None)
+    if not channel or not channel_user_id:
+        return {"success": False, "error": "No channel context. This tool requires an active chat session."}
+
+    try:
+        sqlite_deleted = clear_for_user(channel, channel_user_id)
+        clear_current_mission(channel, channel_user_id)
+        supabase_deleted = delete_messages_for_user(channel, channel_user_id)
+        total = sqlite_deleted + supabase_deleted
+        logger.info("[TOOL] clean_memory: cleared %d messages (SQLite=%d, Supabase=%d) for %s/%s",
+                    total, sqlite_deleted, supabase_deleted, channel, channel_user_id[:20])
+        return {
+            "success": True,
+            "message": f"Cleared {total} messages. Conversation history has been reset.",
+            "deleted_count": total,
+        }
+    except Exception as e:
+        logger.error("[TOOL] clean_memory error: %s", e)
+        return {"success": False, "error": str(e)}
 
 
 def manage_optimization(

@@ -20,7 +20,8 @@ def main():
     print("-" * 60)
 
     try:
-        article = write_article(topic, include_tavily=True)
+        result = write_article(topic)
+        article = result.get("article", "")
         print("SUCCESS - Article generated:")
         print("-" * 60)
         print(article[:2000] + ("..." if len(article) > 2000 else ""))

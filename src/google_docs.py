@@ -367,6 +367,64 @@ def _read_paragraph_element(element: dict) -> str:
     return text_run.get("content", "")
 
 
+def _read_text_run_markdown(text_run: dict) -> str:
+    """Extract markdown-like text from a Google Docs textRun."""
+    content = text_run.get("content", "")
+    if not content:
+        return ""
+    style = text_run.get("textStyle") or {}
+
+    # Preserve simple inline formatting as markdown so downstream rendering
+    # (Ghost lexical conversion) can reconstruct native rich text.
+    if style.get("link", {}).get("url"):
+        url = style["link"]["url"]
+        label = content.rstrip("\n")
+        suffix = "\n" if content.endswith("\n") else ""
+        return f"[{label}]({url}){suffix}" if label else suffix
+
+    if style.get("bold"):
+        content = f"**{content.rstrip(chr(10))}**" + ("\n" if content.endswith("\n") else "")
+    if style.get("italic"):
+        content = f"*{content.rstrip(chr(10))}*" + ("\n" if content.endswith("\n") else "")
+    return content
+
+
+def _read_paragraph_markdown(paragraph: dict) -> str:
+    """Extract one paragraph as markdown, preserving heading/list semantics."""
+    chunks: list[str] = []
+    for elem in paragraph.get("elements", []):
+        text_run = elem.get("textRun")
+        if text_run:
+            chunks.append(_read_text_run_markdown(text_run))
+    text = "".join(chunks).rstrip("\n").strip()
+    if not text:
+        return ""
+
+    p_style = paragraph.get("paragraphStyle") or {}
+    named = (p_style.get("namedStyleType") or "NORMAL_TEXT").upper()
+    heading_map = {
+        "HEADING_1": "#",
+        "HEADING_2": "##",
+        "HEADING_3": "###",
+        "HEADING_4": "####",
+        "HEADING_5": "#####",
+        "HEADING_6": "######",
+    }
+    if named in heading_map:
+        return f"{heading_map[named]} {text}"
+
+    bullet = paragraph.get("bullet")
+    if bullet:
+        nesting = int(bullet.get("nestingLevel", 0) or 0)
+        glyph = str(bullet.get("glyph") or "").strip()
+        indent = "  " * max(0, nesting)
+        is_ordered = bool(re.match(r"^\d", glyph))
+        marker = "1. " if is_ordered else "- "
+        return f"{indent}{marker}{text}"
+
+    return text
+
+
 def _read_structural_elements(elements: list) -> str:
     """Recursively extract markdown-like text from structural elements.
 
@@ -376,8 +434,14 @@ def _read_structural_elements(elements: list) -> str:
     parts = []
     for item in elements or []:
         if "paragraph" in item:
-            for elem in item["paragraph"].get("elements", []):
-                parts.append(_read_paragraph_element(elem))
+            para = item.get("paragraph") or {}
+            para_md = _read_paragraph_markdown(para)
+            if para_md:
+                # Keep list items tight and separate non-list blocks with empty lines.
+                if para_md.lstrip().startswith(("- ", "* ", "1. ")):
+                    parts.append(para_md + "\n")
+                else:
+                    parts.append(para_md + "\n\n")
         elif "table" in item:
             rows: list[list[str]] = []
             for row in item["table"].get("tableRows", []):

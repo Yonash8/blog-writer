@@ -185,6 +185,82 @@ def send_whatsapp_message(
         return resp.json()
 
 
+def send_interactive_buttons_reply(
+    chat_id: str,
+    body: str,
+    buttons: list[dict[str, str]],
+    header: Optional[str] = None,
+    footer: Optional[str] = None,
+) -> dict:
+    """Send a Green API interactive button message (max 3 buttons)."""
+    instance_id = os.getenv("GREEN_API_INSTANCE_ID")
+    token = os.getenv("GREEN_API_TOKEN")
+    base_url = os.getenv("GREEN_API_BASE_URL", "https://api.green-api.com")
+    if not instance_id or not token:
+        raise ValueError("GREEN_API_INSTANCE_ID and GREEN_API_TOKEN must be set in environment")
+    if not buttons or len(buttons) > 3:
+        raise ValueError("buttons must contain 1-3 items")
+
+    normalized = []
+    for b in buttons:
+        button_id = str(b.get("buttonId", "")).strip()
+        button_text = str(b.get("buttonText", "")).strip()
+        if not button_id or not button_text:
+            raise ValueError("Each button must include non-empty buttonId and buttonText")
+        normalized.append({"buttonId": button_id[:64], "buttonText": button_text[:25]})
+
+    payload: dict = {"chatId": chat_id, "body": body[:4096], "buttons": normalized}
+    if header:
+        payload["header"] = header[:255]
+    if footer:
+        payload["footer"] = footer[:255]
+
+    url = f"{base_url.rstrip('/')}/waInstance{instance_id}/sendInteractiveButtonsReply/{token}"
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(url, json=payload, headers={"Content-Type": "application/json"})
+        resp.raise_for_status()
+        return resp.json()
+
+
+def send_poll_message(
+    chat_id: str,
+    message: str,
+    options: list[str],
+    multiple_answers: bool = False,
+) -> dict:
+    """Send a Green API poll message (2-12 options)."""
+    instance_id = os.getenv("GREEN_API_INSTANCE_ID")
+    token = os.getenv("GREEN_API_TOKEN")
+    base_url = os.getenv("GREEN_API_BASE_URL", "https://api.green-api.com")
+    if not instance_id or not token:
+        raise ValueError("GREEN_API_INSTANCE_ID and GREEN_API_TOKEN must be set in environment")
+    if len(options) < 2 or len(options) > 12:
+        raise ValueError("options must contain 2-12 values")
+
+    seen = set()
+    payload_options = []
+    for opt in options:
+        text = str(opt).strip()
+        if not text:
+            raise ValueError("poll options cannot be empty")
+        if text in seen:
+            raise ValueError("poll options must be unique")
+        seen.add(text)
+        payload_options.append({"optionName": text[:100]})
+
+    payload = {
+        "chatId": chat_id,
+        "message": message[:255],
+        "options": payload_options,
+        "multipleAnswers": bool(multiple_answers),
+    }
+    url = f"{base_url.rstrip('/')}/waInstance{instance_id}/sendPoll/{token}"
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(url, json=payload, headers={"Content-Type": "application/json"})
+        resp.raise_for_status()
+        return resp.json()
+
+
 def parse_incoming_text_webhook(payload: dict) -> Optional[dict]:
     """
     Parse Green API webhook payload.

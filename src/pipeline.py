@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Core pipeline: Tavily enrichment + PromptLayer SEO agent."""
+"""Core pipeline: PromptLayer SEO agent."""
 
 import json
 import logging
@@ -12,7 +12,7 @@ import httpx
 from dotenv import load_dotenv
 from tavily import TavilyClient
 
-from src.observability import observe_sub_agent
+from src.observability import observe_sub_agent, log_event
 
 load_dotenv()
 
@@ -53,8 +53,123 @@ def emit_status(text: str) -> None:
 
 
 
+def _get_tavily_client() -> TavilyClient:
+    """Tavily client using TAVILY_API_KEY or TAVILY_RESEARCH_API_KEY (Research-specific override)."""
+    api_key = os.getenv("TAVILY_RESEARCH_API_KEY") or os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "TAVILY_API_KEY or TAVILY_RESEARCH_API_KEY must be set for Tavily Research. "
+            "Add it to .env (same key works for Search and Research)."
+        )
+    return TavilyClient(api_key=api_key)
+
+
+def run_tavily_research(topic: str) -> str:
+    """
+    Run Tavily Research API: comprehensive research report on the topic.
+    Uses SDK: research() to start, then polls get_research() until completed.
+    Returns the research report string (content) for llm_deep_research in PromptLayer.
+    """
+    logger.info("[PIPELINE] Tavily Research START: topic=%r", topic)
+    emit_status("Running Tavily deep research...")
+    start = time.perf_counter()
+
+    client = _get_tavily_client()
+    model = os.getenv("TAVILY_RESEARCH_MODEL", "pro")  # mini=targeted, pro=comprehensive, auto
+    citation_format = os.getenv("TAVILY_RESEARCH_CITATION_FORMAT", "numbered")
+
+    # Research task: broad prompt for article-writing context
+    input_query = (
+        f"Research and synthesize authoritative information about: {topic}. "
+        "Include: key concepts, recent developments, expert opinions, statistics, "
+        "and reliable sources. Structure as a comprehensive report suitable for writing an SEO article."
+    )
+
+    init_response = client.research(
+        input=input_query,
+        model=model,
+        stream=False,
+        citation_format=citation_format,
+    )
+    request_id = init_response.get("request_id")
+    if not request_id:
+        raise RuntimeError(f"Tavily Research returned no request_id: {init_response}")
+
+    logger.info("[PIPELINE] Tavily Research: request_id=%s, polling...", request_id)
+    log_event(
+        "tavily_research_started",
+        request_id=request_id,
+        model=model,
+        citation_format=citation_format,
+    )
+
+    # Poll until completed (Research is async: POST returns 201, GET returns 200 when done)
+    poll_interval = 30
+    max_polls = 30  # ~15 min
+    for i in range(max_polls):
+        check_cancelled()
+        result = client.get_research(request_id)
+        status = result.get("status", "")
+        elapsed_s = i * poll_interval
+        logger.info(
+            "[PIPELINE] Tavily Research poll: request_id=%s status=%s elapsed=%ss",
+            request_id,
+            status or "unknown",
+            elapsed_s,
+        )
+
+        if status == "completed":
+            content = result.get("content", "")
+            if isinstance(content, dict):
+                # output_schema was used; stringify
+                content = json.dumps(content, default=str)
+            content = str(content or "").strip()
+            if not content:
+                raise RuntimeError("Tavily Research completed but returned empty content")
+            latency_ms = (time.perf_counter() - start) * 1000
+            sources = result.get("sources", [])
+            logger.info("[PIPELINE] Tavily Research DONE: content=%d chars, %d sources, %.0fms", len(content), len(sources), latency_ms)
+            log_event(
+                "tavily_research_completed",
+                request_id=request_id,
+                status="completed",
+                sources_count=len(sources),
+                latency_ms=round(latency_ms, 2),
+            )
+            observe_sub_agent(
+                name="tavily_research",
+                input_keys=["topic", "model"],
+                output_size=len(content),
+                latency_ms=latency_ms,
+                status="success",
+                provider="tavily",
+            )
+            return content
+
+        if status == "failed":
+            log_event(
+                "tavily_research_failed",
+                request_id=request_id,
+                status="failed",
+                poll_count=i + 1,
+            )
+            raise RuntimeError("Tavily Research task failed")
+
+        emit_status(f"Tavily research in progress... ({elapsed_s}s)")
+        time.sleep(poll_interval)
+
+    log_event(
+        "tavily_research_failed",
+        request_id=request_id,
+        status="timeout",
+        poll_count=max_polls,
+        waited_seconds=max_polls * poll_interval,
+    )
+    raise RuntimeError("Tavily Research timed out waiting for completion")
+
+
 def run_tavily_enrichment(topic: str, max_results: int = 20) -> list[dict[str, Any]]:
-    """Run Tavily search for enrichment on the topic."""
+    """Run Tavily search for enrichment on the topic (legacy links-based)."""
     logger.info("[PIPELINE] Tavily enrichment: topic=%r, max_results=%d", topic, max_results)
     emit_status("Getting links from Tavily...")
     start = time.perf_counter()
@@ -637,23 +752,15 @@ def write_article_from_research(topic: str, research: str) -> dict[str, Any]:
     return run_promptlayer_agent(topic, research)
 
 
-def write_article(topic: str, include_tavily: bool = False, tavily_max_results: int = 20) -> dict[str, Any]:
+def write_article(topic: str) -> dict[str, Any]:
     """
-    Pipeline: optional Tavily enrichment + PromptLayer SEO agent (research is done inside PL).
+    Pipeline: Tavily Research → PromptLayer SEO agent.
+    Runs Tavily Research for deep research, passes report as llm_deep_research to PL.
     Returns {"article": str, "metadata": Any}.
     """
-    logger.info("[PIPELINE] write_article START: topic=%r, include_tavily=%s, tavily_max_results=%d", topic, include_tavily, tavily_max_results)
-
-    if include_tavily:
-        tavily_results = run_tavily_enrichment(topic, max_results=tavily_max_results)
-        tavily_text = format_tavily_for_research(tavily_results)
-        research = f"## Sources (Tavily Enrichment)\n\n{tavily_text}"
-        logger.info("[PIPELINE] Tavily complete, sources=%d, research_len=%d", len(tavily_results), len(research))
-    else:
-        research = ""
-        logger.info("[PIPELINE] Tavily skipped")
-
-    result = run_promptlayer_agent(topic, research)
+    logger.info("[PIPELINE] write_article START: topic=%r", topic)
+    research = run_tavily_research(topic)
+    result = run_promptlayer_agent(topic, research=research)
     article = result.get("article", "")
     logger.info("[PIPELINE] write_article DONE: article_len=%d chars", len(article))
     return result

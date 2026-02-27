@@ -24,3 +24,6 @@ test_output_image.png
 
 # Local SQLite message cache
 data/messages.db
+data/messages.db-shm
+data/messages.db-wal
+data/messages.db*.corrupt.*

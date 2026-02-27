@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Graph State Viewer</title>
+<title>Active Threads</title>
 <style>
   :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149; --orange: #db6d28; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -44,7 +44,7 @@
 </style>
 </head>
 <body>
-<h1>Graph State Viewer</h1>
+<h1>Active Threads</h1>
 <div id="error"></div>
 
 <div class="controls">
@@ -60,6 +60,7 @@
   </div>
   <div class="card">
     <h2>Graph Position</h2>
+    <p class="empty" style="margin:0;padding:8px 0;font-size:12px">Graph removed — agent is stateless</p>
     <table id="graphTable"><tr><td colspan="2" class="empty">—</td></tr></table>
   </div>
   <div class="card" style="grid-column: 1 / -1;">

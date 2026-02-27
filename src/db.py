@@ -100,6 +100,21 @@ def get_messages(channel: str, channel_user_id: str, limit: int = 100) -> list[d
     return [_to_dict(m) for m in (r.data or [])]
 
 
+def delete_messages_for_user(channel: str, channel_user_id: str) -> int:
+    """Delete all messages for this channel/user. Returns count deleted."""
+    client = get_client()
+    r = (
+        client.table("messages")
+        .delete()
+        .eq("channel", channel)
+        .eq("channel_user_id", channel_user_id)
+        .execute()
+    )
+    # PostgREST returns the deleted rows in data
+    count = len(r.data) if r.data else 0
+    return count
+
+
 # --- Articles ---
 
 def append_article_changelog(article_id: str, action: str) -> None:

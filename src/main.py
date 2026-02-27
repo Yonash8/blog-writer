@@ -310,7 +310,7 @@ def _stream_chat_generator(message: str, channel_user_id: str, history: list):
 async def chat_stream(req: ChatRequest):
     """
     Streaming chat endpoint - sends SSE events with status updates during article writing,
-    then the final result. Use this to get progress updates (deep research, Tavily, PromptLayer).
+    then the final result. Use this to get progress updates (deep research, PromptLayer).
     """
     from src.db import get_messages_for_user
 
@@ -358,17 +358,6 @@ def _process_whatsapp_message(
 
     def _on_status(status_text: str) -> None:
         set_task("whatsapp", chat_id, status_text)
-        throttle_sec = int(os.getenv("CRM_PROGRESS_THROTTLE_SEC", "10"))
-        now = time.monotonic()
-        key = ("whatsapp", chat_id)
-        with _progress_lock:
-            last = _progress_last_send.get(key, 0.0)
-            if now - last >= throttle_sec:
-                _progress_last_send[key] = now
-                try:
-                    send_message_chunked(chat_id, f"_{status_text}_", quoted_message_id=None)
-                except Exception as e:
-                    logger.warning("[WHATSAPP] Progress message send failed: %s", e)
 
     response = ""
     try:
@@ -704,6 +693,13 @@ async def admin_traces(
     )
 
 
+@app.get("/admin")
+async def admin_root():
+    """Admin root - redirect to traces dashboard."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/admin/traces")
+
+
 @app.get("/api/traces")
 async def api_list_traces(
     channel: Optional[str] = None,
@@ -766,13 +762,13 @@ AGENTS_DEFINITION = [
         ],
         "model_type": "chat",
         "prompts": ["master_system_core", "playbooks", "whatsapp_format"],
-        "tools": ["db", "google_docs", "web_search", "send_image", "write_article", "improve_article", "generate_images", "generate_hero_image", "approve_hero_image", "generate_infographic", "approve_infographic"],
+        "tools": ["db", "google_docs", "web_search", "send_image", "write_article", "improve_article", "generate_images", "generate_hero_image", "approve_hero_image", "generate_infographic", "approve_infographic", "clean_memory"],
         "sub_agents": ["Article Writer", "Article Improver", "Image Placement", "Infographic Analyzer", "Hero & Infographic Generator", "Generic Image Generator"],
     },
     {
         "id": "article_writer",
         "name": "Article Writer",
-        "description": "Deep research + Tavily + PromptLayer. Invoked by write_article.",
+        "description": "PromptLayer SEO pipeline. Invoked by write_article.",
         "config_keys": [{"key": "deep_research_model", "label": "Model", "type": "provider_model"}],
         "model_type": "chat",
         "prompts": ["deep_research"],
@@ -834,7 +830,7 @@ AGENTS_DEFINITION = [
 
 @app.get("/admin/graph-state")
 async def admin_graph_state(request: Request):
-    """Admin page: live graph state viewer."""
+    """Admin page: active article threads (legacy table)."""
     return templates.TemplateResponse(
         "admin/graph_state.html",
         {"request": request},
@@ -843,14 +839,22 @@ async def admin_graph_state(request: Request):
 
 @app.get("/api/admin/graph-state")
 async def api_get_graph_state(whatsapp_user_id: Optional[str] = None):
-    """Deprecated: LangGraph removed. Returns threads from DB for reference."""
+    """Returns active article threads from DB (legacy table, agent is now stateless)."""
     from src.db import get_client
     try:
         r = get_client().table("active_article_threads").select("*").execute()
         threads = r.data or []
     except Exception:
         threads = []
-    return {"deprecated": "LangGraph removed — agent is now stateless", "threads": threads}
+    thread = None
+    if whatsapp_user_id:
+        thread = next((t for t in threads if t.get("whatsapp_user_id") == whatsapp_user_id), None)
+    return {
+        "threads": threads,
+        "thread": thread,
+        "state": None,  # Graph removed; no state to show
+        "next": [],
+    }
 
 
 @app.get("/admin/agents")

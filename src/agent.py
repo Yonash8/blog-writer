@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+import textwrap
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -24,6 +25,7 @@ from src.observability import (
 from src.pipeline import status_callback as pipeline_status_callback, cancel_check as pipeline_cancel_check, TaskCancelledError
 
 logger = logging.getLogger(__name__)
+trace_logger = logging.getLogger("devchat.trace")
 
 # System prompt loaded from DB via get_master_system_prompt()
 
@@ -168,21 +170,47 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "send_interactive",
+            "description": (
+                "Send WhatsApp interactive options to the user. "
+                "Use mode='buttons' for 1-3 quick choices, or mode='poll' for 2-12 options. "
+                "If WhatsApp interactive delivery fails, fallback text options are returned."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["buttons", "poll"], "description": "Interactive type to send"},
+                    "body": {"type": "string", "description": "Main text shown above options"},
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Option labels. Buttons: 1-3, Poll: 2-12.",
+                    },
+                    "header": {"type": "string", "description": "Optional heading (buttons mode)"},
+                    "footer": {"type": "string", "description": "Optional footer (buttons mode)"},
+                    "multiple_answers": {"type": "boolean", "description": "Allow multiple answers (poll mode)", "default": False},
+                },
+                "required": ["mode", "body", "choices"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_article",
             "description": (
                 "Full article pipeline: PromptLayer SEO writer (research is handled inside PromptLayer). "
-                "Optionally enriches with Tavily web sources when useful. "
+                "Requires explicit user approval in the tool call via approved=true before execution. "
                 "Auto-saves to DB and creates Google Doc. Returns article_id, content, google_doc_url, metadata."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string", "description": "The topic to write about"},
-                    "include_tavily": {"type": "boolean", "description": "Include Tavily web source enrichment (default False).", "default": False},
-                    "tavily_max_results": {"type": "integer", "description": "Max Tavily sources (5-20)", "default": 20},
+                    "approved": {"type": "boolean", "description": "Set true only after explicit user approval to run write_article."},
                     "changelog_entry": {"type": "string", "description": "Brief changelog entry, e.g. 'Created draft on topic X'"},
                 },
-                "required": ["topic"],
+                "required": ["topic", "approved"],
             },
         },
     },
@@ -473,6 +501,20 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "clean_memory",
+            "description": (
+                "Clear the conversation cache for the current user. "
+                "Call this when the user says: clean memory, clear memory, forget, reset chat, "
+                "clear history, start fresh, wipe conversation, etc. "
+                "Removes all stored messages so the next turn starts with no prior context. "
+                "Always call this tool—do not just explain; actually run it."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -517,10 +559,38 @@ def _openai_tools_to_anthropic() -> list[dict]:
 _ACTION_FIRST_PAT = re.compile(
     r"\b("
     r"write|create|generate|improve|edit|revise|add|inject|approve|publish|push|"
-    r"ghost|seo|metadata|image|hero|infographic|optimi[sz]e|deploy|run"
+    r"ghost|seo|metadata|image|hero|infographic|optimi[sz]e|deploy|run|"
+    r"clean|forget|reset|wipe"
     r")\b",
     re.IGNORECASE,
 )
+
+_ARTICLE_WORK_PAT = re.compile(
+    r"\b("
+    r"article|draft|doc|google doc|outline|edit|revise|improve|rewrite|"
+    r"hero|infographic|seo|publish|ghost|title|headline|intro|conclusion|"
+    r"source|citation|this one|that one|it"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_SESSION_SUMMARY_ATTEMPTS: set[tuple[str, str, str]] = set()
+_MISSION_TOOL_MAP = {
+    "generate_hero_image": "Generate hero image for the current article.",
+    "approve_hero_image": "Finalize hero image in article.",
+    "generate_infographic": "Generate infographic for the current article.",
+    "approve_infographic": "Finalize infographic placement in article.",
+    "generate_seo_metadata": "Generate SEO metadata for the current article.",
+    "improve_article": "Revise the current article draft.",
+    "push_to_ghost": "Publish current article to Ghost.",
+}
+_APPROVAL_REQUIRED_TOOLS = {
+    "improve_article",
+    "approve_hero_image",
+    "approve_infographic",
+    "push_to_ghost",
+}
+_ALLOWED_REACTION_REPLIES = ("👍", "🔥", "✅")
 
 
 def _should_use_sonnet_first_turn(user_message: str) -> bool:
@@ -530,6 +600,93 @@ def _should_use_sonnet_first_turn(user_message: str) -> bool:
     if len(text) <= 16 and text.lower() in {"ok", "yes", "no", "thanks", "thx", "why", "how"}:
         return False
     return bool(_ACTION_FIRST_PAT.search(text))
+
+
+def _should_attempt_session_article_summary(user_message: str, history: Optional[list[dict]]) -> bool:
+    """Run summary caching once when a likely article work session starts."""
+    text = (user_message or "").strip().lower()
+    if not text:
+        return False
+    if len(history or []) <= 2:
+        return True
+    return bool(_ARTICLE_WORK_PAT.search(text))
+
+
+def _infer_mission_from_user_message(user_message: str) -> Optional[str]:
+    text = (user_message or "").strip().lower()
+    if not text:
+        return None
+    if re.search(r"\b(hero|cover image|thumbnail)\b", text):
+        return "Create and approve a hero image for the current article."
+    if re.search(r"\b(infographic|diagram|chart)\b", text):
+        return "Create and place an infographic in the current article."
+    if re.search(r"\b(seo|metadata|slug|description|tags)\b", text):
+        return "Generate SEO metadata for the current article."
+    if re.search(r"\b(publish|post|ship|push to ghost|ghost)\b", text):
+        return "Publish the current article to Ghost."
+    if re.search(r"\b(improve|edit|revise|rewrite|fix|polish)\b", text) and "article" in text:
+        return "Revise the current article draft."
+    if re.search(r"\b(write|create|draft)\b", text) and "article" in text:
+        return "Write a new article draft."
+    if re.search(r"\b(memory|forget|reset|clear)\b", text):
+        return "Reset conversation memory."
+    return None
+
+
+def _is_tool_approval_required(name: str, arguments: Optional[dict]) -> bool:
+    """Return True when tool execution requires explicit user approval."""
+    if name in _APPROVAL_REQUIRED_TOOLS:
+        return True
+    if name == "manage_optimization":
+        action = str((arguments or {}).get("action", "")).strip().lower()
+        return action == "deploy"
+    return False
+
+
+def _has_explicit_human_approval(user_message: str) -> bool:
+    """Conservative check for explicit approval phrasing in latest user turn."""
+    text = (user_message or "").strip().lower()
+    if not text:
+        return False
+    if re.search(r"\b(do not|don't|stop|wait|hold|cancel|no)\b", text):
+        return False
+    return bool(
+        re.search(
+            r"\b(yes|approve|approved|go ahead|go-ahead|proceed|ship it|deploy|publish|run it|do it|yalla)\b",
+            text,
+        )
+    )
+
+
+def _normalize_response_style(text: str) -> str:
+    """Allow strict standalone reactions; never allow reaction emojis inside text."""
+    out = (text or "").strip()
+    if not out:
+        return out
+
+    # If response is only allowed reaction emojis/spaces, reduce to one emoji.
+    if re.fullmatch(r"[\s👍🔥✅]+", out):
+        for ch in out:
+            if ch in _ALLOWED_REACTION_REPLIES:
+                return ch
+        return out
+
+    # Otherwise, remove allowed reaction emojis from inside regular text.
+    for emo in _ALLOWED_REACTION_REPLIES:
+        out = out.replace(emo, "")
+    out = re.sub(r"[ \t]{2,}", " ", out).strip()
+    return out
+
+
+def _wrap_for_log(text: str, width: int = 60) -> str:
+    """Wrap long prompt lines for readable terminal logs."""
+    lines = []
+    for ln in (text or "").splitlines():
+        if not ln.strip():
+            lines.append("")
+            continue
+        lines.append(textwrap.fill(ln, width=width, break_long_words=False, break_on_hyphens=False))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +704,7 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         google_docs_tool as _google_docs,
         web_search as _web_search,
         send_image_tool as _send_image,
+        send_interactive_tool as _send_interactive,
         write_article as _write_article,
         improve_article as _improve_article,
         inject_links as _inject_links,
@@ -559,6 +717,7 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         push_to_ghost as _push_to_ghost,
         fetch_promptlayer_execution as _fetch_pl_execution,
         fetch_history as _fetch_history,
+        clean_memory_tool as _clean_memory,
         manage_optimization as _manage_optimization,
     )
 
@@ -566,23 +725,20 @@ def _execute_tool(name: str, arguments: dict) -> Any:
     is_expensive = name in EXPENSIVE_TOOLS or (
         name == "db" and arguments.get("action") in EXPENSIVE_DB_ACTIONS
     )
+    arg_preview = {
+        k: (str(v)[:80] + "..." if isinstance(v, str) and len(str(v)) > 80 else v)
+        for k, v in arguments.items()
+    }
     if is_expensive:
-        logger.warning(
-            "[AGENT] EXPENSIVE tool call: name=%s, args=%s",
-            name,
-            {k: (str(v)[:80] + "..." if isinstance(v, str) and len(str(v)) > 80 else v) for k, v in arguments.items()},
-        )
+        trace_logger.warning("tool_call | expensive:%s args=%s", name, arg_preview)
     else:
-        logger.info(
-            "[AGENT] Tool call: name=%s, args=%s",
-            name,
-            {k: (str(v)[:80] + "..." if isinstance(v, str) and len(str(v)) > 80 else v) for k, v in arguments.items()},
-        )
+        trace_logger.info("tool_call | %s args=%s", name, arg_preview)
     tools = {
         "db": _db,
         "google_docs": _google_docs,
         "web_search": _web_search,
         "send_image": _send_image,
+        "send_interactive": _send_interactive,
         "write_article": _write_article,
         "improve_article": _improve_article,
         "inject_links": _inject_links,
@@ -595,6 +751,7 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         "push_to_ghost": _push_to_ghost,
         "fetch_promptlayer_execution": _fetch_pl_execution,
         "fetch_history": _fetch_history,
+        "clean_memory": _clean_memory,
         "manage_optimization": _manage_optimization,
     }
     fn = tools.get(name)
@@ -608,7 +765,12 @@ def _execute_tool(name: str, arguments: dict) -> Any:
         has_error = isinstance(result, dict) and ("error" in result or result.get("success") is False)
         observe_tool(name, arguments, result, latency_ms, error=result.get("error") if has_error else None)
         if has_error:
-            logger.error("[AGENT] Tool %s returned error: %s", name, result.get("error"))
+            trace_logger.error(
+                "tool_result | %s error runtime_ms=%.1f error=%s",
+                name,
+                latency_ms,
+                result.get("error"),
+            )
             if "success" not in result:
                 result["success"] = False
             if "retry_hint" not in result and "error" in result:
@@ -618,7 +780,12 @@ def _execute_tool(name: str, arguments: dict) -> Any:
                 result = dict(result)
                 result["success"] = True
             preview = str(result)[:200] + "..." if len(str(result)) > 200 else str(result)
-            logger.info("[AGENT] Tool %s OK: result=%s", name, preview)
+            trace_logger.info(
+                "tool_result | %s ok runtime_ms=%.1f result=%s",
+                name,
+                latency_ms,
+                preview,
+            )
         return result
     except TaskCancelledError:
         # Don't swallow cancellation — let it propagate to the agent loop
@@ -626,7 +793,7 @@ def _execute_tool(name: str, arguments: dict) -> Any:
     except Exception as e:
         latency_ms = (time.perf_counter() - start) * 1000
         observe_tool(name, arguments, None, latency_ms, error=str(e))
-        logger.exception("[AGENT] Tool %s EXCEPTION: %s", name, e)
+        trace_logger.exception("tool_result | %s exception runtime_ms=%.1f error=%s", name, latency_ms, e)
         err_str = str(e)
         retry_hint = "Try again or use a different tool."
         if "token" in err_str.lower() or "limit" in err_str.lower():
@@ -678,6 +845,8 @@ def run_agent(
     Returns {message, article?}.
     If on_status is provided, it is called with progress updates during article writing.
     """
+    run_start = time.perf_counter()
+
     if trace_id:
         set_trace_id(trace_id)
         init_trace_payload(user_message, channel, channel_user_id)
@@ -686,8 +855,13 @@ def run_agent(
         history_len=len(history) if history else 0,
         format_for_whatsapp=format_for_whatsapp,
     )
-    logger.info("[AGENT] Run started: message_len=%d, history_len=%d, channel=%s, channel_user_id=%s",
-                len(user_message), len(history) if history else 0, channel, channel_user_id)
+    logger.info(
+        "[AGENT] Run started: message_len=%d, history_len=%d, channel=%s, channel_user_id=%s",
+        len(user_message),
+        len(history) if history else 0,
+        channel,
+        channel_user_id,
+    )
 
     token = None
     cancel_token = None
@@ -727,6 +901,12 @@ def run_agent(
             "If multiple actions are clearly requested, do them in sequence without asking for step-by-step confirmation. "
             "Only ask a brief clarifying question when proceeding could target the wrong resource or create irreversible side effects."
         )
+        context_parts.append(
+            "## Reply Style\n"
+            "Keep replies short and casual, like the user's tone. Prefer concise wording over formal phrasing. "
+            "You may reply with a standalone reaction only: 👍 or 🔥 or ✅. "
+            "Never place these reaction emojis inside a normal text message."
+        )
 
         # Fetch article context + history in parallel
         history_limit = get_config_int("agent_history_limit", 10)
@@ -734,13 +914,66 @@ def run_agent(
             context_parts.append(f"CURRENT CONTEXT:\nchannel={channel}\nchannel_user_id={channel_user_id}")
             from concurrent.futures import ThreadPoolExecutor
             from src.db import get_latest_article_for_user, list_articles, get_pending_article_images
-            from src.message_cache import get_recent_with_backfill
+            from src.message_cache import get_recent_with_backfill, get_current_mission, set_current_mission
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 f_article = pool.submit(get_latest_article_for_user, channel, channel_user_id)
                 f_history = pool.submit(get_recent_with_backfill, channel, channel_user_id, limit=history_limit)
+                f_mission = pool.submit(get_current_mission, channel, channel_user_id)
                 latest = f_article.result()
                 history = f_history.result()
+                current_mission = f_mission.result()
+
+            inferred_mission = _infer_mission_from_user_message(user_message)
+            if inferred_mission:
+                existing = (current_mission or {}).get("mission", "")
+                if inferred_mission != existing:
+                    set_current_mission(
+                        channel=channel,
+                        channel_user_id=channel_user_id,
+                        mission=inferred_mission,
+                        article_id=(latest or {}).get("id"),
+                        status="active",
+                    )
+                    current_mission = get_current_mission(channel, channel_user_id)
+                    trace_logger.info("mission | updated from user intent")
+
+            if current_mission and current_mission.get("status") == "active":
+                mission_ctx = (
+                    "CURRENT MISSION:\n"
+                    f"- mission={current_mission.get('mission', '')}\n"
+                    f"- article_id={current_mission.get('article_id') or 'none'}\n"
+                    f"- updated_at={current_mission.get('updated_at', '')}"
+                )
+                context_parts.append(mission_ctx)
+
+            # Lazy cache: summarize article once at the start of a work session.
+            if latest and latest.get("id"):
+                key = (channel, channel_user_id, latest["id"])
+                if key not in _SESSION_SUMMARY_ATTEMPTS and _should_attempt_session_article_summary(user_message, history):
+                    _SESSION_SUMMARY_ATTEMPTS.add(key)
+                    try:
+                        from src.article_memory import has_cached_summary, summarize_with_sonnet, format_summary_memory
+                        from src.db import add_message as _add_message
+
+                        if not has_cached_summary(history or [], latest["id"]):
+                            summary_text = summarize_with_sonnet(
+                                latest.get("title", "Untitled"),
+                                latest.get("content") or "",
+                            )
+                            summary_msg = format_summary_memory(
+                                title=latest.get("title", "Untitled"),
+                                article_id=latest["id"],
+                                google_doc_url=latest.get("google_doc_url"),
+                                content=latest.get("content") or "",
+                                summary=summary_text,
+                            )
+                            _add_message(channel, channel_user_id, "assistant", summary_msg)
+                            history = (history or []) + [{"role": "assistant", "content": summary_msg}]
+                            # Keep memory logs concise; avoid dumping memory payloads.
+                            trace_logger.info("memory | cached_summary")
+                    except Exception as e:
+                        logger.warning("[AGENT] Failed to cache session article summary: %s", e)
 
             try:
                 if latest:
@@ -822,6 +1055,12 @@ def run_agent(
                 {"type": "text", "text": static_system, "cache_control": {"type": "ephemeral"}},
             ]
 
+        # In dev chat, print the full prompts for debugging.
+        if channel == "dev":
+            trace_logger.info("master_core | static_system_full |\n%s", _wrap_for_log(static_system, width=60))
+            if context_str.strip():
+                trace_logger.info("master_core | dynamic_context_full |\n%s", _wrap_for_log(context_str, width=60))
+
         # Build Anthropic messages from history
         messages: list[dict] = []
         for m in (history or [])[-history_limit:]:
@@ -847,6 +1086,7 @@ def run_agent(
                     haiku_model, sonnet_model, len(messages), len(tools))
 
         for turn in range(max_turns):
+            turn_start = time.perf_counter()
             current_model = first_turn_model if turn == 0 else sonnet_model
             max_tokens = 2048 if turn == 0 else 8096
             resp = client.messages.create(
@@ -856,14 +1096,19 @@ def run_agent(
                 messages=messages,
                 tools=tools,
             )
-            logger.info("[AGENT] model=%s (turn %d)", current_model, turn + 1)
-
             # Extract text content
             result_text = "\n".join(
                 b.text for b in resp.content if hasattr(b, "text")
             ).strip()
-            logger.info("[AGENT] response: stop_reason=%s, text_len=%d",
-                        resp.stop_reason, len(result_text))
+            turn_ms = (time.perf_counter() - turn_start) * 1000
+            trace_logger.info(
+                "agent_turn | turn=%d model=%s stop_reason=%s text_len=%d runtime_ms=%.1f",
+                turn + 1,
+                current_model,
+                resp.stop_reason,
+                len(result_text),
+                turn_ms,
+            )
 
             if resp.stop_reason != "tool_use":
                 break
@@ -886,7 +1131,47 @@ def run_agent(
             tool_results = []
             for tu in [b for b in resp.content if b.type == "tool_use"]:
                 logger.info("[AGENT] Executing tool (turn %d): %s", turn + 1, tu.name)
-                result = _execute_tool(tu.name, tu.input)
+                if _is_tool_approval_required(tu.name, tu.input) and not _has_explicit_human_approval(user_message):
+                    result = {
+                        "success": False,
+                        "needs_approval": True,
+                        "error": f"Explicit user approval required before running {tu.name}.",
+                        "approval_instruction": (
+                            "Ask for explicit approval first (e.g., 'yes approve', 'go ahead', "
+                            "'publish now'), then retry the same tool."
+                        ),
+                        "retry_hint": "Wait for explicit approval in the latest user message, then retry.",
+                    }
+                    trace_logger.info("approval_gate | blocked tool=%s waiting_for_human_approval", tu.name)
+                else:
+                    result = _execute_tool(tu.name, tu.input)
+                # Master agent owns mission updates; tools only provide execution signals.
+                if channel and channel_user_id and isinstance(result, dict) and result.get("success") is not False:
+                    try:
+                        from src.message_cache import set_current_mission
+                        next_mission = _MISSION_TOOL_MAP.get(tu.name)
+                        if next_mission:
+                            mission_status = "done" if tu.name == "push_to_ghost" else "active"
+                            latest_article_id = latest["id"] if "latest" in locals() and isinstance(latest, dict) and latest.get("id") else None
+                            mission_article_id = (
+                                result.get("article_id")
+                                or (tu.input or {}).get("article_id")
+                                or latest_article_id
+                            )
+                            set_current_mission(
+                                channel=channel,
+                                channel_user_id=channel_user_id,
+                                mission=next_mission,
+                                article_id=mission_article_id,
+                                status=mission_status,
+                            )
+                            trace_logger.info(
+                                "mission | updated from tool %s status=%s",
+                                tu.name,
+                                mission_status,
+                            )
+                    except Exception as mission_err:
+                        logger.warning("[AGENT] Mission update failed after tool %s: %s", tu.name, mission_err)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tu.id,
@@ -896,8 +1181,9 @@ def run_agent(
         else:
             logger.warning("[AGENT] Reached max_turns=%d without a final answer", max_turns)
 
+        final_text = _normalize_response_style(result_text)
         return {
-            "message": result_text,
+            "message": final_text,
             "article": None,
         }
     except TaskCancelledError:
@@ -907,6 +1193,8 @@ def run_agent(
             "article": None,
         }
     finally:
+        total_ms = (time.perf_counter() - run_start) * 1000
+        trace_logger.info("agent_run | finished runtime_ms=%.1f", total_ms)
         if token is not None:
             pipeline_status_callback.reset(token)
         if cancel_token is not None:
