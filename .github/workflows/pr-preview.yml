@@ -1,0 +1,81 @@
+name: PR Preview Deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+  FLY_ORG: ${{ vars.FLY_ORG }}
+  APP_NAME: blog-writer-pr-${{ github.event.pull_request.number }}
+
+jobs:
+  deploy:
+    name: deploy
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Create app if missing
+        run: |
+          if ! flyctl status --app "$APP_NAME" >/dev/null 2>&1; then
+            flyctl apps create "$APP_NAME" --org "$FLY_ORG"
+          fi
+
+      - name: Stage secrets
+        run: |
+          flyctl secrets set --app "$APP_NAME" --stage \
+            SUPABASE_URL="${{ secrets.SUPABASE_URL }}" \
+            SUPABASE_SERVICE_ROLE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}" \
+            OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
+            PROMPTLAYER_API_KEY="${{ secrets.PROMPTLAYER_API_KEY }}" \
+            TAVILY_API_KEY="${{ secrets.TAVILY_API_KEY }}" \
+            GOOGLE_API_KEY="${{ secrets.GOOGLE_API_KEY }}" \
+            GHOST_ADMIN_URL="${{ secrets.GHOST_ADMIN_URL }}" \
+            GHOST_ADMIN_API_KEY="${{ secrets.GHOST_ADMIN_API_KEY }}" \
+            GHOST_AUTHOR_EMAIL="${{ secrets.GHOST_AUTHOR_EMAIL }}" \
+            WEBHOOK_BASE_URL="https://${APP_NAME}.fly.dev"
+
+      - name: Deploy
+        run: |
+          flyctl deploy \
+            --app "$APP_NAME" \
+            --config fly.preview.toml \
+            --remote-only \
+            --ha=false \
+            --strategy immediate \
+            --wait-timeout 300
+
+      - name: Sticky PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pr-preview
+          message: |
+            Preview deployed: https://${{ env.APP_NAME }}.fly.dev
+            App: `${{ env.APP_NAME }}`
+            Commit: `${{ github.event.pull_request.head.sha }}`
+
+  destroy:
+    name: destroy
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl apps destroy "$APP_NAME" --yes || true
+      - uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pr-preview
+          message: |
+            Preview app `${{ env.APP_NAME }}` destroyed.
