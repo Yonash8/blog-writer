@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { cancelSession, getSession, getSessionMessages, type Session } from '../lib/sessions'
 import {
   attachIfRunning,
@@ -104,6 +104,7 @@ function transcriptFromServerMessages(msgs: { role: string; content: string }[])
 
 export default function ChatPane() {
   const { id: sessionId } = useParams<{ id: string }>()
+  const navigate = useNavigate()
   const [state, setState] = useState<RunState | null>(
     sessionId ? snapshot(sessionId) : null,
   )
@@ -142,6 +143,14 @@ export default function ChatPane() {
           setTimeout(load, 2000)
         }
       } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        // 404 means the session in the URL doesn't exist (deleted, or a
+        // stale link from before the DB was reset). Bounce to / so
+        // SessionLanding picks/creates a real one.
+        if (msg.includes('404')) {
+          navigate('/', { replace: true })
+          return
+        }
         console.error('load session metadata failed', e)
       }
     }

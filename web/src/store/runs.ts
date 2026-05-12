@@ -279,6 +279,14 @@ export async function startRun(sessionId: string, message: string): Promise<void
       signal: ctl.signal,
     })
     if (!r.ok) {
+      // 404 means the session was deleted server-side. Drop local state
+      // and bounce to / so SessionLanding picks/creates a real one,
+      // rather than leaving the user stuck sending into a dead URL.
+      if (r.status === 404) {
+        clearSession(sessionId)
+        window.location.replace('/console/')
+        return
+      }
       _handleEvent(sessionId, { seq: s.lastSeq + 1, type: 'error', message: `request failed: ${r.status}` })
       return
     }
