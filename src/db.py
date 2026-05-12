@@ -740,7 +740,8 @@ def list_sessions(channel: str, channel_user_id: str) -> list[dict]:
             .execute()
         )
         if legacy.data:
-            default = create_session(channel, channel_user_id, title="Default")
+            # Leave title NULL so the next user message triggers Haiku naming.
+            default = create_session(channel, channel_user_id, title=None)
             try:
                 client.table("messages").update(
                     {"session_id": default["id"]}

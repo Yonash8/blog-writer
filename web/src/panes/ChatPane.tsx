@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useParams } from 'react-router-dom'
-import { cancelSession, getSessionMessages } from '../lib/sessions'
+import { cancelSession, getSession, getSessionMessages, type Session } from '../lib/sessions'
 import {
   attachIfRunning,
   setTranscript,
@@ -107,6 +107,7 @@ export default function ChatPane() {
   const [state, setState] = useState<RunState | null>(
     sessionId ? snapshot(sessionId) : null,
   )
+  const [session, setSession] = useState<Session | null>(null)
   const [input, setInput] = useState('')
   const [now, setNow] = useState<number>(Date.now())
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -120,6 +121,36 @@ export default function ChatPane() {
     const unsub = subscribe(sessionId, (s) => setState({ ...s }))
     return unsub
   }, [sessionId])
+
+  // Fetch session metadata (mainly: title) on mount + whenever a run ends,
+  // so the Haiku-generated title appears automatically after the first
+  // assistant reply without the user having to refresh. Haiku runs in a
+  // daemon thread on the backend, so the title may not be set the instant
+  // the run finishes — poll a few times if it's still empty.
+  useEffect(() => {
+    if (!sessionId) return
+    let cancelled = false
+    let attempt = 0
+    const maxAttempts = 8 // ~16s total at 2s spacing
+    async function load() {
+      try {
+        const s = await getSession(sessionId!)
+        if (cancelled) return
+        setSession(s)
+        if (!(s.title || '').trim() && attempt < maxAttempts) {
+          attempt += 1
+          setTimeout(load, 2000)
+        }
+      } catch (e) {
+        console.error('load session metadata failed', e)
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, state?.running])
 
   // Hydrate transcript from the server once per session, then attach to any
   // in-flight run so the live token stream resumes from where we left off.
@@ -191,10 +222,13 @@ export default function ChatPane() {
       }}
     >
       <div className="flex shrink-0 items-center justify-between border-b border-[var(--color-border)] px-4 py-2 text-xs uppercase tracking-wider text-[var(--color-fg-dim)]">
-        <div className="flex items-center gap-3">
-          <span>chat</span>
-          <span className="normal-case text-[10px] text-[var(--color-fg-dim)]">
-            {sessionId.slice(0, 12)}…
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="shrink-0">chat</span>
+          <span
+            className="truncate normal-case text-[12px] text-[var(--color-fg)]"
+            title={sessionId}
+          >
+            {(session?.title || '').trim() || 'Untitled session'}
           </span>
         </div>
         <div className="flex items-center gap-3">

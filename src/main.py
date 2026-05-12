@@ -585,6 +585,18 @@ async def create_session_endpoint(req: Optional[SessionCreateRequest] = Body(Non
     return session
 
 
+@app.get("/api/sessions/{session_id}")
+async def get_session_endpoint(session_id: str):
+    """Single-session fetch. Useful for the ChatPane header which needs the
+    title (especially after the async Haiku rename finishes)."""
+    from src.db import get_session
+    sess = get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    sess.update(_running_meta(session_id))
+    return sess
+
+
 @app.patch("/api/sessions/{session_id}")
 async def rename_session_endpoint(session_id: str, req: SessionRenameRequest):
     from src.db import rename_session, get_session

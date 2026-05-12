@@ -37,6 +37,14 @@ export async function listSessions(): Promise<Session[]> {
   return data.sessions
 }
 
+export async function getSession(sessionId: string): Promise<Session> {
+  const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    headers: authHeaders(),
+  })
+  if (!r.ok) throw new Error(`get session: ${r.status}`)
+  return r.json()
+}
+
 export async function createSession(title?: string): Promise<Session> {
   const r = await fetch('/api/sessions', {
     method: 'POST',
