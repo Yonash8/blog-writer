@@ -65,6 +65,25 @@ jobs:
             App: `${{ env.APP_NAME }}`
             Commit: `${{ github.event.pull_request.head.sha }}`
 
+      - name: Update PR description with preview URL
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PREVIEW_URL: https://${{ env.APP_NAME }}.fly.dev
+        run: |
+          body=$(gh pr view "$PR_NUMBER" --json body -q .body)
+          block=$'<!-- pr-preview-start -->\nPreview: '"$PREVIEW_URL"$'\n<!-- pr-preview-end -->'
+          if printf '%s' "$body" | grep -q '<!-- pr-preview-start -->'; then
+            new_body=$(printf '%s' "$body" | awk -v b="$block" '
+              /<!-- pr-preview-start -->/ { print b; skip=1; next }
+              /<!-- pr-preview-end -->/   { skip=0; next }
+              !skip
+            ')
+          else
+            new_body=$(printf '%s\n\n%s' "$block" "$body")
+          fi
+          gh pr edit "$PR_NUMBER" --body "$new_body"
+
   destroy:
     name: destroy
     if: github.event.action == 'closed'
@@ -79,3 +98,18 @@ jobs:
           header: pr-preview
           message: |
             Preview app `${{ env.APP_NAME }}` destroyed.
+
+      - name: Strip preview URL from PR description
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          body=$(gh pr view "$PR_NUMBER" --json body -q .body)
+          if printf '%s' "$body" | grep -q '<!-- pr-preview-start -->'; then
+            new_body=$(printf '%s' "$body" | awk '
+              /<!-- pr-preview-start -->/ { skip=1; next }
+              /<!-- pr-preview-end -->/   { skip=0; next }
+              !skip
+            ')
+            gh pr edit "$PR_NUMBER" --body "$new_body"
+          fi
