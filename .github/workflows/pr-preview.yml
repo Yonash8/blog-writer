@@ -71,18 +71,21 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PREVIEW_URL: https://${{ env.APP_NAME }}.fly.dev
         run: |
-          body=$(gh pr view "$PR_NUMBER" --json body -q .body)
-          block=$'<!-- pr-preview-start -->\nPreview: '"$PREVIEW_URL"$'\n<!-- pr-preview-end -->'
-          if printf '%s' "$body" | grep -q '<!-- pr-preview-start -->'; then
-            new_body=$(printf '%s' "$body" | awk -v b="$block" '
-              /<!-- pr-preview-start -->/ { print b; skip=1; next }
-              /<!-- pr-preview-end -->/   { skip=0; next }
-              !skip
-            ')
-          else
-            new_body=$(printf '%s\n\n%s' "$block" "$body")
-          fi
-          gh pr edit "$PR_NUMBER" --body "$new_body"
+          gh pr view "$PR_NUMBER" --json body -q .body > /tmp/pr_body.txt
+          python3 <<'PY' > /tmp/pr_body_new.txt
+          import os, re, sys
+          with open('/tmp/pr_body.txt') as f:
+              body = f.read()
+          url = os.environ['PREVIEW_URL']
+          block = f"<!-- pr-preview-start -->\nPreview: {url}\n<!-- pr-preview-end -->"
+          pattern = r"<!-- pr-preview-start -->.*?<!-- pr-preview-end -->"
+          if re.search(pattern, body, flags=re.DOTALL):
+              new_body = re.sub(pattern, block, body, count=1, flags=re.DOTALL)
+          else:
+              new_body = block + "\n\n" + body
+          sys.stdout.write(new_body)
+          PY
+          gh pr edit "$PR_NUMBER" --body-file /tmp/pr_body_new.txt
 
   destroy:
     name: destroy
@@ -104,12 +107,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          body=$(gh pr view "$PR_NUMBER" --json body -q .body)
-          if printf '%s' "$body" | grep -q '<!-- pr-preview-start -->'; then
-            new_body=$(printf '%s' "$body" | awk '
-              /<!-- pr-preview-start -->/ { skip=1; next }
-              /<!-- pr-preview-end -->/   { skip=0; next }
-              !skip
-            ')
-            gh pr edit "$PR_NUMBER" --body "$new_body"
-          fi
+          gh pr view "$PR_NUMBER" --json body -q .body > /tmp/pr_body.txt
+          python3 <<'PY' > /tmp/pr_body_new.txt
+          import re, sys
+          with open('/tmp/pr_body.txt') as f:
+              body = f.read()
+          pattern = r"<!-- pr-preview-start -->.*?<!-- pr-preview-end -->\n*"
+          new_body = re.sub(pattern, "", body, flags=re.DOTALL)
+          sys.stdout.write(new_body)
+          PY
+          gh pr edit "$PR_NUMBER" --body-file /tmp/pr_body_new.txt
