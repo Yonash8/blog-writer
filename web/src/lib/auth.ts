@@ -45,6 +45,44 @@ export function authHeaders(extra: HeadersInit = {}): HeadersInit {
   return cred ? { ...extra, Authorization: `Bearer ${cred}` } : extra
 }
 
+/**
+ * Install a global fetch interceptor so any 401 from `/api/*` (except the
+ * auth endpoints themselves, which legitimately return 401 on bad
+ * password) drops our credentials and bounces the user to the login
+ * screen. Without this, a stale token sits in localStorage forever and
+ * the SPA keeps making doomed requests.
+ */
+let _interceptorInstalled = false
+export function installAuthInterceptor(): void {
+  if (_interceptorInstalled) return
+  _interceptorInstalled = true
+  const orig = window.fetch.bind(window)
+  window.fetch = async (input, init) => {
+    const r = await orig(input, init)
+    if (r.status === 401) {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      // Strip origin so the check works for both relative and absolute URLs.
+      const path = url.replace(/^https?:\/\/[^/]+/, '')
+      const isApi = path.startsWith('/api/')
+      const isAuthEndpoint =
+        path.startsWith('/api/auth/login') || path.startsWith('/api/auth/me')
+      if (isApi && !isAuthEndpoint) {
+        clearApiKey()
+        // Hard reload so React state, runs.ts cached subscriptions, and any
+        // background polls all reset cleanly. The next boot lands on
+        // LoginGate because /api/auth/me reports unauthenticated.
+        window.location.replace('/console/')
+      }
+    }
+    return r
+  }
+}
+
 export async function login(password: string): Promise<boolean> {
   const r = await fetch('/api/auth/login', {
     method: 'POST',
