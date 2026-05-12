@@ -360,7 +360,7 @@ def _generate_session_title_async(session_id: str, user_message: str) -> None:
             from anthropic import Anthropic
             client = Anthropic()
             resp = client.messages.create(
-                model="claude-3-5-haiku-20241022",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=40,
                 system=(
                     "Return a 3-7 word title (no quotes, no period) that captures the "
