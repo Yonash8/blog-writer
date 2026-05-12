@@ -44,6 +44,8 @@ jobs:
             GHOST_ADMIN_URL="${{ secrets.GHOST_ADMIN_URL }}" \
             GHOST_ADMIN_API_KEY="${{ secrets.GHOST_ADMIN_API_KEY }}" \
             GHOST_AUTHOR_EMAIL="${{ secrets.GHOST_AUTHOR_EMAIL }}" \
+            CONSOLE_PASSWORD="${{ secrets.CONSOLE_PASSWORD || secrets.WEB_API_KEY }}" \
+            WEB_API_KEY="${{ secrets.WEB_API_KEY }}" \
             WEBHOOK_BASE_URL="https://${APP_NAME}.fly.dev"
 
       - name: Deploy

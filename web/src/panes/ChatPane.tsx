@@ -1,17 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { chatStream } from '../lib/api'
-import { getChatId, rotateChatId } from '../lib/conversation'
+import { useParams } from 'react-router-dom'
+import { cancelSession, getSessionMessages } from '../lib/sessions'
+import {
+  attachIfRunning,
+  setTranscript,
+  snapshot,
+  startRun,
+  subscribe,
+  type Line,
+  type RunState,
+} from '../store/runs'
 
-type Line =
-  | { kind: 'user'; text: string }
-  | { kind: 'status'; text: string }
-  | { kind: 'assistant'; text: string }
-  | { kind: 'error'; text: string }
-  | { kind: 'system'; text: string }
-
-const PROMPT = 'Me:'
+const PROMPT = '>'
 
 function fmtElapsed(ms: number): string {
   const s = Math.floor(ms / 1000)
@@ -86,117 +88,101 @@ function Markdown({ text }: { text: string }) {
   )
 }
 
-export default function ChatPane() {
-  const [lines, setLines] = useState<Line[]>([])
-  const [streamBuf, setStreamBuf] = useState<string>('')
-  const [input, setInput] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [chatId, setChatId] = useState<string>(() => getChatId())
-  // Single in-place "active" status line — repeated status polls just update
-  // .text and let the clock keep ticking.
-  const [activeStatus, setActiveStatus] = useState<{ text: string; startedAt: number } | null>(null)
-  const [now, setNow] = useState<number>(Date.now())
+function transcriptFromServerMessages(msgs: { role: string; content: string }[]): Line[] {
+  return msgs.map((m) => {
+    if (m.role === 'user') return { kind: 'user', text: m.content }
+    if (m.role === 'assistant') {
+      // The backend writes `[cancelled]` / `[error: ...]` stubs when a run
+      // fails so the transcript reflects what was attempted — tag them.
+      if (m.content.startsWith('[cancelled]')) return { kind: 'system', text: '[cancelled]' }
+      if (m.content.startsWith('[error:')) return { kind: 'error', text: m.content.slice(1, -1) }
+      return { kind: 'assistant', text: m.content }
+    }
+    return { kind: 'system', text: m.content }
+  })
+}
 
-  function newConversation() {
-    const id = rotateChatId()
-    setChatId(id)
-    setLines([])
-    setStreamBuf('')
-    setInput('')
-    setActiveStatus(null)
-  }
+export default function ChatPane() {
+  const { id: sessionId } = useParams<{ id: string }>()
+  const [state, setState] = useState<RunState | null>(
+    sessionId ? snapshot(sessionId) : null,
+  )
+  const [input, setInput] = useState('')
+  const [now, setNow] = useState<number>(Date.now())
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const tailRef = useRef<HTMLDivElement>(null)
 
-  // Tick the clock once a second while a status is active.
+  // Re-bind the subscription whenever the route switches to a new session.
   useEffect(() => {
-    if (!activeStatus) return
+    if (!sessionId) return
+    setState({ ...snapshot(sessionId) })
+    const unsub = subscribe(sessionId, (s) => setState({ ...s }))
+    return unsub
+  }, [sessionId])
+
+  // Hydrate transcript from the server once per session, then attach to any
+  // in-flight run so the live token stream resumes from where we left off.
+  useEffect(() => {
+    if (!sessionId) return
+    const cur = snapshot(sessionId)
+    let cancelled = false
+    if (!cur.hydrated) {
+      getSessionMessages(sessionId)
+        .then((msgs) => {
+          if (cancelled) return
+          setTranscript(sessionId, transcriptFromServerMessages(msgs))
+        })
+        .catch((e) => console.error('hydrate session messages failed', e))
+    }
+    void attachIfRunning(sessionId)
+    return () => {
+      cancelled = true
+      // Intentionally do NOT abort the SSE — leaving this session must not
+      // stop its run. The subscription stays alive in runs.ts.
+    }
+  }, [sessionId])
+
+  useEffect(() => {
+    if (!state?.activeStatus) return
     const id = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(id)
-  }, [activeStatus])
+  }, [state?.activeStatus])
 
-  // Scroll the bottom of the transcript into view whenever content changes.
   useEffect(() => {
     tailRef.current?.scrollIntoView({ block: 'end', behavior: 'auto' })
-  }, [lines, streamBuf, busy, activeStatus])
+  }, [state?.transcript, state?.streamBuf, state?.activeStatus, state?.running])
 
-  // Keep the input focused unless the user is selecting text elsewhere.
   useEffect(() => {
-    if (!busy) inputRef.current?.focus()
-  }, [busy])
+    if (!state?.running) inputRef.current?.focus()
+  }, [state?.running])
 
-  function append(line: Line) {
-    setLines((prev) => [...prev, line])
+  if (!sessionId || !state) {
+    return (
+      <div className="flex h-full items-center justify-center text-[var(--color-fg-dim)]">
+        no session selected
+      </div>
+    )
   }
 
   async function send() {
+    if (!sessionId) return
     const msg = input.trim()
-    if (!msg || busy) return
-    // Slash commands handled client-side
-    if (msg === '/new' || msg === '/clear' || msg === '/reset') {
-      newConversation()
-      return
-    }
+    if (!msg || state?.running) return
     setInput('')
-    setBusy(true)
-    setStreamBuf('')
-    setActiveStatus(null)
-    append({ kind: 'user', text: msg })
-
-    // Finalize the active status (if any) into a permanent transcript line,
-    // freezing the elapsed time at the moment it was superseded.
-    const finalizeActive = () => {
-      setActiveStatus((cur) => {
-        if (cur) {
-          const elapsed = fmtElapsed(Date.now() - cur.startedAt)
-          setLines((prev) => [...prev, { kind: 'status', text: `${cur.text} (${elapsed})` }])
-        }
-        return null
-      })
-    }
-
-    try {
-      for await (const evt of chatStream(msg, chatId)) {
-        if (evt.type === 'status') {
-          // Strip any trailing "(30s)" / "(1m 30s)" the backend may include —
-          // we render our own ticking clock.
-          const cleaned = evt.text.replace(/\s*\(\d+\s*[hms](?:\s+\d+\s*[hms])*\)\s*$/i, '').trim()
-          setActiveStatus((cur) => ({
-            text: cleaned,
-            startedAt: cur?.startedAt ?? Date.now(),
-          }))
-        } else if (evt.type === 'token') {
-          // First token after a status block → freeze the status line
-          finalizeActive()
-          // If a tool ran between assistant turns, commit any prior streaming
-          // text so subsequent tokens start on a fresh line.
-          setStreamBuf((cur) => cur + evt.text)
-        } else if (evt.type === 'done') {
-          finalizeActive()
-          setStreamBuf('')
-          if (evt.error) {
-            append({ kind: 'error', text: evt.message })
-          } else {
-            append({ kind: 'assistant', text: evt.message })
-          }
-        }
-      }
-    } catch (err) {
-      finalizeActive()
-      setStreamBuf('')
-      append({ kind: 'error', text: `request failed: ${err instanceof Error ? err.message : String(err)}` })
-    } finally {
-      setBusy(false)
-    }
+    await startRun(sessionId, msg)
   }
 
+  async function handleCancel() {
+    if (!sessionId) return
+    await cancelSession(sessionId)
+  }
+
+  const { transcript, streamBuf, activeStatus, running, lastTool } = state
   return (
     <div
       className="flex h-full flex-col bg-[var(--color-bg)]"
       onClick={(e) => {
-        // Click anywhere in the pane → refocus the prompt, unless the user
-        // is interacting with a link/button or selecting text.
         const target = e.target as HTMLElement
         if (target.tagName === 'A' || target.tagName === 'BUTTON') return
         const sel = window.getSelection()
@@ -206,25 +192,32 @@ export default function ChatPane() {
     >
       <div className="flex shrink-0 items-center justify-between border-b border-[var(--color-border)] px-4 py-2 text-xs uppercase tracking-wider text-[var(--color-fg-dim)]">
         <div className="flex items-center gap-3">
+          <span>chat</span>
           <span className="normal-case text-[10px] text-[var(--color-fg-dim)]">
-            {chatId.slice(0, 12)}…
+            {sessionId.slice(0, 12)}…
           </span>
         </div>
         <div className="flex items-center gap-3">
-          <button
-            onClick={newConversation}
-            disabled={busy}
-            title="start a new conversation (/new)"
-            className="rounded border border-[var(--color-border)] px-2 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-fg-dim)] hover:border-[var(--color-accent-dim)] hover:text-[var(--color-fg)] disabled:opacity-50"
+          {running && (
+            <button
+              onClick={handleCancel}
+              title="cancel run"
+              className="rounded border border-[var(--color-border)] px-2 py-0.5 text-[10px] uppercase tracking-wider text-[var(--color-bad)] hover:border-[var(--color-bad)]"
+            >
+              cancel
+            </button>
+          )}
+          <span
+            className={running ? 'text-[var(--color-warn)]' : 'text-[var(--color-good)]'}
+            title={lastTool ? `running tool: ${lastTool}` : undefined}
           >
-            + new
-          </button>
+            {running ? `● running${lastTool ? ` · ${lastTool}` : ''}` : '○ idle'}
+          </span>
         </div>
       </div>
 
-      {/* One scrollable terminal — transcript and the live prompt share the same flow. */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 text-[14px] leading-relaxed">
-        {lines.map((line, i) => (
+        {transcript.map((line, i) => (
           <div key={i} className="py-0.5">
             {line.kind === 'assistant' ? (
               <div className="flex items-start gap-1">
@@ -254,7 +247,6 @@ export default function ChatPane() {
           </div>
         ))}
 
-        {/* Live in-place status line — backend polls collapse here, clock ticks. */}
         {activeStatus && (
           <div className="py-0.5 whitespace-pre-wrap break-words">
             <span className="select-none text-[var(--color-fg-dim)]">·&nbsp;</span>
@@ -265,7 +257,6 @@ export default function ChatPane() {
           </div>
         )}
 
-        {/* Streaming assistant tokens (live preview) */}
         {streamBuf && (
           <div className="py-0.5">
             <div className="flex items-start gap-1">
@@ -278,18 +269,16 @@ export default function ChatPane() {
           </div>
         )}
 
-        {/* Busy with no streamed tokens yet — show a "thinking" indicator inline */}
-        {busy && !streamBuf && (
+        {running && !streamBuf && !activeStatus && (
           <div className="py-0.5 text-[var(--color-fg-dim)]">
             <span className="select-none">·&nbsp;</span>
             <span className="cursor-blink">█</span>
           </div>
         )}
 
-        {/* Active prompt — the input lives inside the transcript flow */}
-        {!busy && (
+        {!running && (
           <div className="flex items-baseline py-0.5">
-            <span className="select-none font-semibold text-[var(--color-accent)]">{PROMPT}&nbsp;</span>
+            <span className="select-none text-[var(--color-accent)]">{PROMPT}&nbsp;</span>
             <input
               ref={inputRef}
               value={input}

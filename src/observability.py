@@ -171,12 +171,20 @@ def init_trace_payload(
     user_message: str,
     channel: Optional[str] = None,
     channel_user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> dict:
-    """Initialize the trace payload for the current request."""
+    """Initialize the trace payload for the current request.
+
+    ``run_id`` is aliased to ``trace_id`` (set via ``set_trace_id`` before this
+    call); we mirror it onto the payload so downstream views can filter by
+    run without juggling two UUIDs.
+    """
     payload = {
         "user_message": user_message,
         "channel": channel or "unknown",
         "channel_user_id": channel_user_id or "unknown",
+        "session_id": session_id,
+        "run_id": get_trace_id(),
         "root": {"type": "agent_run", "children": []},
         "events": [],
         "start_ts": datetime.now(timezone.utc).isoformat(),

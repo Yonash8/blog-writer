@@ -87,47 +87,6 @@ export async function patchPrompts(body: Record<string, unknown>): Promise<void>
   if (!r.ok) throw new Error(`patch prompts: ${r.status}`)
 }
 
-export type ChatEvent =
-  | { type: 'status'; text: string }
-  | { type: 'token'; text: string }
-  | { type: 'done'; message: string; article?: unknown; error?: boolean }
-
-/**
- * POST /api/chat/stream — yields parsed SSE events until the stream ends.
- * EventSource doesn't support POST, so we use fetch + manual SSE parsing.
- */
-export async function* chatStream(message: string, channelUserId?: string): AsyncGenerator<ChatEvent> {
-  const r = await fetch('/api/chat/stream', {
-    method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ message, channel_user_id: channelUserId ?? 'web-console' }),
-  })
-  if (!r.ok || !r.body) throw new Error(`chat: ${r.status}`)
-
-  const reader = r.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    let idx: number
-    while ((idx = buf.indexOf('\n\n')) >= 0) {
-      const frame = buf.slice(0, idx)
-      buf = buf.slice(idx + 2)
-      for (const line of frame.split('\n')) {
-        if (line.startsWith('data: ')) {
-          try {
-            yield JSON.parse(line.slice(6)) as ChatEvent
-          } catch {
-            // skip malformed
-          }
-        }
-      }
-    }
-  }
-}
-
 /**
  * Subscribe to /api/events/stream — server-broadcast log_event firehose.
  * EventSource doesn't accept custom headers, so we forward the API key as a query param.

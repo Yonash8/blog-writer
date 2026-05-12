@@ -840,6 +840,7 @@ def run_agent(
     on_status: Optional[Callable[[str], None]] = None,
     on_token: Optional[Callable[[str], None]] = None,
     trace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Run the master agent with tool-calling loop.
@@ -853,7 +854,7 @@ def run_agent(
 
     if trace_id:
         set_trace_id(trace_id)
-        init_trace_payload(user_message, channel, channel_user_id)
+        init_trace_payload(user_message, channel, channel_user_id, session_id=session_id)
     log_event(
         "agent_run_start",
         history_len=len(history) if history else 0,
@@ -873,8 +874,19 @@ def run_agent(
         token = pipeline_status_callback.set(on_status)
         logger.info("[AGENT] Status callback enabled")
 
-    # Set up cancellation check if channel/user provided
-    if channel and channel_user_id:
+    # Set up cancellation check.
+    # When a session_id is supplied (web flow), key the cancel check off
+    # f"session:{session_id}" so two sessions of the same user don't share a
+    # cancel flag. Otherwise fall back to the legacy (channel, user) key for
+    # callers like WhatsApp that don't use sessions.
+    if session_id:
+        from src.task_state import is_cancel_requested_by_key
+        _cancel_key = f"session:{session_id}"
+        cancel_token = pipeline_cancel_check.set(
+            lambda: is_cancel_requested_by_key(_cancel_key)
+        )
+        logger.info("[AGENT] Cancel check enabled for session %s", session_id[:8])
+    elif channel and channel_user_id:
         from src.task_state import is_cancel_requested
         cancel_token = pipeline_cancel_check.set(
             lambda: is_cancel_requested(channel, channel_user_id)
@@ -920,12 +932,20 @@ def run_agent(
             from src.db import get_latest_article_for_user, list_articles, get_pending_article_images
             from src.message_cache import get_recent_with_backfill, get_current_mission, set_current_mission
 
+            # When the caller is a session-aware web flow, it has already
+            # fetched session-scoped history; refetching from the per-user
+            # cache here would mix transcripts from other sessions together.
+            _refetch_history = session_id is None
             with ThreadPoolExecutor(max_workers=3) as pool:
                 f_article = pool.submit(get_latest_article_for_user, channel, channel_user_id)
-                f_history = pool.submit(get_recent_with_backfill, channel, channel_user_id, limit=history_limit)
+                f_history = (
+                    pool.submit(get_recent_with_backfill, channel, channel_user_id, limit=history_limit)
+                    if _refetch_history else None
+                )
                 f_mission = pool.submit(get_current_mission, channel, channel_user_id)
                 latest = f_article.result()
-                history = f_history.result()
+                if f_history is not None:
+                    history = f_history.result()
                 current_mission = f_mission.result()
 
             inferred_mission = _infer_mission_from_user_message(user_message)
@@ -1146,6 +1166,13 @@ def run_agent(
             tool_results = []
             for tu in [b for b in resp.content if b.type == "tool_use"]:
                 logger.info("[AGENT] Executing tool (turn %d): %s", turn + 1, tu.name)
+                # Surface the tool name to the SSE stream so the sidebar can
+                # show "Session X · running tool: web_search" while it's busy.
+                if on_status is not None:
+                    try:
+                        on_status(f"running tool: {tu.name}")
+                    except Exception:
+                        pass
                 if _is_tool_approval_required(tu.name, tu.input) and not _has_explicit_human_approval(user_message):
                     result = {
                         "success": False,
