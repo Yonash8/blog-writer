@@ -1,10 +1,15 @@
-"""In-flight task tracking for status queries without interrupting long-running tasks."""
+"""In-flight task tracking for status queries without interrupting long-running tasks.
+
+Keys are opaque strings. WhatsApp uses ``f"{channel}:{channel_user_id}"`` via the
+legacy tuple-argument API; the web flow keys per-session via ``f"session:{id}"``
+through the ``_by_key`` siblings. Both paths share the same store.
+"""
 
 import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -21,8 +26,8 @@ class TaskState:
     cancel_requested: bool = False
 
 
-# Key: (channel, channel_user_id) e.g. ("whatsapp", "972546678582@c.us") or ("web", "default")
-_task_store: dict[tuple[str, str], TaskState] = {}
+# Key: opaque string (e.g. "whatsapp:972...", "web:default", "session:<uuid>")
+_task_store: dict[str, TaskState] = {}
 _lock = threading.Lock()
 _TASK_STALE_TIMEOUT_SEC = int(os.getenv("TASK_STALE_TIMEOUT_SEC", "900"))
 _CANCEL_GRACE_SEC = int(os.getenv("TASK_CANCEL_GRACE_SEC", "20"))
@@ -72,14 +77,18 @@ def is_status_question(text: str) -> bool:
     return False
 
 
-def set_task(channel: str, channel_user_id: str, status_text: str, current_step: Optional[str] = None) -> None:
-    """Register or update an in-flight task."""
+def _make_key(channel: str, channel_user_id: str) -> str:
+    return f"{channel}:{channel_user_id}"
+
+
+# --- Key-based API (preferred for new code) -----------------------------------
+
+def set_task_by_key(key: str, status_text: str, current_step: Optional[str] = None) -> None:
+    """Register or update an in-flight task by opaque key."""
     now = time.monotonic()
     with _lock:
-        key = (channel, channel_user_id)
         existing = _task_store.get(key)
         if existing:
-            # Preserve started_at + cancel_requested across status updates.
             existing.status_text = status_text
             existing.current_step = current_step
             existing.updated_at = now
@@ -90,7 +99,7 @@ def set_task(channel: str, channel_user_id: str, status_text: str, current_step:
                 updated_at=now,
                 current_step=current_step,
             )
-        logger.debug("[TASK_STATE] set %s/%s: %r", channel, channel_user_id[:20], status_text[:80])
+        logger.debug("[TASK_STATE] set %s: %r", key[:40], status_text[:80])
 
 
 def _is_stale(task: TaskState, now: float) -> bool:
@@ -102,31 +111,70 @@ def _is_stale(task: TaskState, now: float) -> bool:
     return age >= _TASK_STALE_TIMEOUT_SEC
 
 
-def get_task(channel: str, channel_user_id: str) -> Optional[TaskState]:
-    """Get current task state for a channel/user. Returns None if no task in flight."""
+def get_task_by_key(key: str) -> Optional[TaskState]:
     with _lock:
-        key = (channel, channel_user_id)
         task = _task_store.get(key)
         if not task:
             return None
         now = time.monotonic()
         if _is_stale(task, now):
             _task_store.pop(key, None)
-            logger.warning("[TASK_STATE] stale task auto-cleared for %s/%s", channel, channel_user_id[:20])
+            logger.warning("[TASK_STATE] stale task auto-cleared for %s", key[:40])
             return None
         return task
 
 
-def clear_task(channel: str, channel_user_id: str) -> None:
-    """Clear the in-flight task when it completes."""
+def clear_task_by_key(key: str) -> None:
     with _lock:
-        _task_store.pop((channel, channel_user_id), None)
-        logger.debug("[TASK_STATE] cleared %s/%s", channel, channel_user_id[:20] if channel_user_id else "")
+        _task_store.pop(key, None)
+        logger.debug("[TASK_STATE] cleared %s", key[:40])
+
+
+def has_task_by_key(key: str) -> bool:
+    return get_task_by_key(key) is not None
+
+
+def request_cancel_by_key(key: str) -> bool:
+    with _lock:
+        task = _task_store.get(key)
+        if task:
+            task.cancel_requested = True
+            task.updated_at = time.monotonic()
+            logger.info("[TASK_STATE] Cancel requested for %s", key[:40])
+            return True
+        return False
+
+
+def is_cancel_requested_by_key(key: str) -> bool:
+    task = get_task_by_key(key)
+    return task.cancel_requested if task else False
+
+
+# --- Legacy tuple API (WhatsApp + existing call sites) ------------------------
+# Thin wrappers around the key-based functions so we don't break callers.
+
+def set_task(channel: str, channel_user_id: str, status_text: str, current_step: Optional[str] = None) -> None:
+    set_task_by_key(_make_key(channel, channel_user_id), status_text, current_step)
+
+
+def get_task(channel: str, channel_user_id: str) -> Optional[TaskState]:
+    return get_task_by_key(_make_key(channel, channel_user_id))
+
+
+def clear_task(channel: str, channel_user_id: str) -> None:
+    clear_task_by_key(_make_key(channel, channel_user_id))
 
 
 def has_task(channel: str, channel_user_id: str) -> bool:
-    """Return True if there is an in-flight task for this channel/user."""
-    return get_task(channel, channel_user_id) is not None
+    return has_task_by_key(_make_key(channel, channel_user_id))
+
+
+def request_cancel(channel: str, channel_user_id: str) -> bool:
+    return request_cancel_by_key(_make_key(channel, channel_user_id))
+
+
+def is_cancel_requested(channel: str, channel_user_id: str) -> bool:
+    return is_cancel_requested_by_key(_make_key(channel, channel_user_id))
 
 
 def is_cancel_message(text: str) -> bool:
@@ -138,21 +186,3 @@ def is_cancel_message(text: str) -> bool:
         if t == phrase or t.startswith(phrase + " ") or t.endswith(" " + phrase):
             return True
     return False
-
-
-def request_cancel(channel: str, channel_user_id: str) -> bool:
-    """Request cancellation of the in-flight task. Returns True if a task was found."""
-    with _lock:
-        task = _task_store.get((channel, channel_user_id))
-        if task:
-            task.cancel_requested = True
-            task.updated_at = time.monotonic()
-            logger.info("[TASK_STATE] Cancel requested for %s/%s", channel, channel_user_id[:20])
-            return True
-        return False
-
-
-def is_cancel_requested(channel: str, channel_user_id: str) -> bool:
-    """Check if cancellation has been requested for the in-flight task."""
-    task = get_task(channel, channel_user_id)
-    return task.cancel_requested if task else False

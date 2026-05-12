@@ -32,19 +32,47 @@ jobs:
           fi
 
       - name: Stage secrets
+        # Push secrets via env vars rather than inline ${{ secrets.X }}
+        # substitution so values containing shell metacharacters (e.g. '@',
+        # '!', '$') survive the bash command intact. Use `flyctl secrets
+        # import` which reads KEY=VALUE lines from stdin and handles quoting.
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PROMPTLAYER_API_KEY: ${{ secrets.PROMPTLAYER_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GHOST_ADMIN_URL: ${{ secrets.GHOST_ADMIN_URL }}
+          GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
+          GHOST_AUTHOR_EMAIL: ${{ secrets.GHOST_AUTHOR_EMAIL }}
+          CONSOLE_PASSWORD: ${{ secrets.CONSOLE_PASSWORD }}
+          WEB_API_KEY: ${{ secrets.WEB_API_KEY }}
         run: |
-          flyctl secrets set --app "$APP_NAME" --stage \
-            SUPABASE_URL="${{ secrets.SUPABASE_URL }}" \
-            SUPABASE_SERVICE_ROLE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
-            ANTHROPIC_API_KEY="${{ secrets.ANTHROPIC_API_KEY }}" \
-            OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
-            PROMPTLAYER_API_KEY="${{ secrets.PROMPTLAYER_API_KEY }}" \
-            TAVILY_API_KEY="${{ secrets.TAVILY_API_KEY }}" \
-            GOOGLE_API_KEY="${{ secrets.GOOGLE_API_KEY }}" \
-            GHOST_ADMIN_URL="${{ secrets.GHOST_ADMIN_URL }}" \
-            GHOST_ADMIN_API_KEY="${{ secrets.GHOST_ADMIN_API_KEY }}" \
-            GHOST_AUTHOR_EMAIL="${{ secrets.GHOST_AUTHOR_EMAIL }}" \
-            WEBHOOK_BASE_URL="https://${APP_NAME}.fly.dev"
+          {
+            echo "SUPABASE_URL=$SUPABASE_URL"
+            echo "SUPABASE_SERVICE_ROLE_KEY=$SUPABASE_SERVICE_ROLE_KEY"
+            echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+            echo "OPENAI_API_KEY=$OPENAI_API_KEY"
+            echo "PROMPTLAYER_API_KEY=$PROMPTLAYER_API_KEY"
+            echo "TAVILY_API_KEY=$TAVILY_API_KEY"
+            echo "GOOGLE_API_KEY=$GOOGLE_API_KEY"
+            echo "GHOST_ADMIN_URL=$GHOST_ADMIN_URL"
+            echo "GHOST_ADMIN_API_KEY=$GHOST_ADMIN_API_KEY"
+            echo "GHOST_AUTHOR_EMAIL=$GHOST_AUTHOR_EMAIL"
+            # Prefer CONSOLE_PASSWORD; fall back to WEB_API_KEY so existing
+            # secret-only setups still gate the preview.
+            if [ -n "$CONSOLE_PASSWORD" ]; then
+              echo "CONSOLE_PASSWORD=$CONSOLE_PASSWORD"
+            elif [ -n "$WEB_API_KEY" ]; then
+              echo "CONSOLE_PASSWORD=$WEB_API_KEY"
+            fi
+            if [ -n "$WEB_API_KEY" ]; then
+              echo "WEB_API_KEY=$WEB_API_KEY"
+            fi
+            echo "WEBHOOK_BASE_URL=https://${APP_NAME}.fly.dev"
+          } | flyctl secrets import --app "$APP_NAME" --stage
 
       - name: Deploy
         run: |

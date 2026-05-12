@@ -8,9 +8,11 @@ Provides:
 - compute_trace_summary for per-trace aggregation (tokens, cost, steps, duration)
 """
 
+import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextvars import ContextVar
@@ -169,12 +171,20 @@ def init_trace_payload(
     user_message: str,
     channel: Optional[str] = None,
     channel_user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> dict:
-    """Initialize the trace payload for the current request."""
+    """Initialize the trace payload for the current request.
+
+    ``run_id`` is aliased to ``trace_id`` (set via ``set_trace_id`` before this
+    call); we mirror it onto the payload so downstream views can filter by
+    run without juggling two UUIDs.
+    """
     payload = {
         "user_message": user_message,
         "channel": channel or "unknown",
         "channel_user_id": channel_user_id or "unknown",
+        "session_id": session_id,
+        "run_id": get_trace_id(),
         "root": {"type": "agent_run", "children": []},
         "events": [],
         "start_ts": datetime.now(timezone.utc).isoformat(),
@@ -233,6 +243,54 @@ def _sanitize_args(args: dict) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Live event fan-out (for /api/events/stream SSE subscribers)
+# ---------------------------------------------------------------------------
+# log_event is sync and called from any thread (including the run_agent worker
+# thread spawned in _stream_chat_generator). Subscribers are async, each owns
+# an asyncio.Queue bound to its FastAPI handler's event loop. We schedule
+# put_nowait on each subscriber's loop via call_soon_threadsafe, dropping the
+# event for any subscriber whose queue is full or whose loop has closed.
+
+_subscribers: list[tuple["asyncio.AbstractEventLoop", "asyncio.Queue[dict]"]] = []
+_subscribers_lock = threading.Lock()
+
+
+def subscribe_events() -> tuple["asyncio.AbstractEventLoop", "asyncio.Queue[dict]"]:
+    """Register a new live-event subscriber. Must be called from an async context."""
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue[dict] = asyncio.Queue(maxsize=200)
+    with _subscribers_lock:
+        _subscribers.append((loop, q))
+    return loop, q
+
+
+def unsubscribe_events(loop: "asyncio.AbstractEventLoop", q: "asyncio.Queue[dict]") -> None:
+    with _subscribers_lock:
+        try:
+            _subscribers.remove((loop, q))
+        except ValueError:
+            pass
+
+
+def _broadcast(event: dict) -> None:
+    with _subscribers_lock:
+        subs = list(_subscribers)
+    for loop, q in subs:
+        try:
+            loop.call_soon_threadsafe(_try_put, q, event)
+        except RuntimeError:
+            # loop closed — subscriber will be cleaned up on its own
+            pass
+
+
+def _try_put(q: "asyncio.Queue[dict]", event: dict) -> None:
+    try:
+        q.put_nowait(event)
+    except asyncio.QueueFull:
+        pass
+
+
 def log_event(event_type: str, **kwargs) -> None:
     """Emit a structured event. Appends to trace payload and logs to stderr."""
     trace_id = get_trace_id()
@@ -247,6 +305,7 @@ def log_event(event_type: str, **kwargs) -> None:
         payload["events"].append(event)
     if OBSERVABILITY_LEVEL in ("verbose", "debug"):
         logger.debug("[OBS] %s", json.dumps(event, default=str)[:500])
+    _broadcast(event)
 
 
 # ---------------------------------------------------------------------------
