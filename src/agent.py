@@ -838,12 +838,16 @@ def run_agent(
     max_turns: int = 10,
     format_for_whatsapp: bool = False,
     on_status: Optional[Callable[[str], None]] = None,
+    on_token: Optional[Callable[[str], None]] = None,
     trace_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Run the master agent with tool-calling loop.
     Returns {message, article?}.
     If on_status is provided, it is called with progress updates during article writing.
+    If on_token is provided, it is called with each text delta from the LLM as it
+    streams. Tokens stream across every turn; the caller can concatenate them for
+    a live preview but should rely on the returned `message` as canonical.
     """
     run_start = time.perf_counter()
 
@@ -1089,13 +1093,24 @@ def run_agent(
             turn_start = time.perf_counter()
             current_model = first_turn_model if turn == 0 else sonnet_model
             max_tokens = 2048 if turn == 0 else 8096
-            resp = client.messages.create(
+            # Use streaming so the UI can show tokens live. get_final_message()
+            # returns the same Message shape that messages.create() does, so
+            # downstream code (resp.content, resp.stop_reason) works unchanged.
+            with client.messages.stream(
                 model=current_model,
                 max_tokens=max_tokens,
                 system=system,
                 messages=messages,
                 tools=tools,
-            )
+            ) as stream:
+                for delta in stream.text_stream:
+                    if on_token is not None and delta:
+                        try:
+                            on_token(delta)
+                        except Exception:
+                            # Never let a token-callback failure break the run
+                            pass
+                resp = stream.get_final_message()
             # Extract text content
             result_text = "\n".join(
                 b.text for b in resp.content if hasattr(b, "text")

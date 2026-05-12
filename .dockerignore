@@ -6,3 +6,6 @@ __pycache__/
 **/__pycache__/
 *.pyc
 .git/
+# Don't ship local node_modules or stale dist — the Node build stage produces a fresh dist
+web/node_modules/
+web/dist/

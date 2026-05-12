@@ -18,9 +18,10 @@ import logging
 from typing import Optional
 
 from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from src.observability import log_event, persist_trace
+from src.observability import log_event, persist_trace, subscribe_events, unsubscribe_events
 
 templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
 
@@ -89,7 +90,15 @@ async def api_key_middleware(request: Request, call_next):
 
     auth = request.headers.get("Authorization", "")
     x_key = request.headers.get("X-API-Key", "")
-    provided = auth[7:] if auth.startswith("Bearer ") else x_key
+    # EventSource cannot send custom headers — allow `?key=...` as a fallback
+    # for SSE endpoints. Acceptable since WEB_API_KEY is a shared secret.
+    query_key = request.query_params.get("key", "")
+    if auth.startswith("Bearer "):
+        provided = auth[7:]
+    elif x_key:
+        provided = x_key
+    else:
+        provided = query_key
 
     if provided != web_api_key:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
@@ -117,6 +126,17 @@ async def root():
     """Root endpoint - redirect to API docs."""
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/docs")
+
+
+# Mount the React console SPA at /console if the bundle exists.
+# Dev: `cd web && npm run dev` (Vite on :5173 proxies to this server on :8000).
+# Prod: the Dockerfile builds web/dist via a Node stage and copies it in.
+_WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+if _WEB_DIST.exists():
+    app.mount("/console", StaticFiles(directory=str(_WEB_DIST), html=True), name="console")
+    logger.info("[CONSOLE] mounted /console -> %s", _WEB_DIST)
+else:
+    logger.info("[CONSOLE] %s not found - run `cd web && npm run build` to enable /console", _WEB_DIST)
 
 
 @app.get("/api/chat/status")
@@ -228,12 +248,18 @@ def _stream_chat_generator(message: str, channel_user_id: str, history: list):
     set_task("web", user_key, "Processing your request...")
 
     logger.info("[STREAM] Starting stream: message=%r, channel_user_id=%s, history_len=%d", message[:80], channel_user_id, len(history))
+    # Two queues drained by the polling loop below: status updates (one per
+    # emit_status call) and token deltas (each ~one chunk from the LLM).
     status_updates = []
+    token_chunks: list[str] = []
     result_holder = []
 
     def on_status(text: str) -> None:
         set_task("web", user_key, text)
         status_updates.append(text)
+
+    def on_token(delta: str) -> None:
+        token_chunks.append(delta)
 
     error_holder: list[Exception] = []
 
@@ -246,6 +272,7 @@ def _stream_chat_generator(message: str, channel_user_id: str, history: list):
                 channel="web",
                 channel_user_id=user_key,
                 on_status=on_status,
+                on_token=on_token,
                 trace_id=trace_id,
             )
             result_holder.append(res)
@@ -268,13 +295,19 @@ def _stream_chat_generator(message: str, channel_user_id: str, history: list):
 
     thread = threading.Thread(target=run)
     thread.start()
-    last_len = 0
+    last_status = 0
+    last_token = 0
 
-    while thread.is_alive() or last_len < len(status_updates):
-        while last_len < len(status_updates):
-            yield f"data: {json.dumps({'type': 'status', 'text': status_updates[last_len]})}\n\n"
-            last_len += 1
-        time.sleep(0.2)
+    # Drain both queues until the agent thread exits and all pending events flushed.
+    # Sleep is short so token deltas feel live in the UI.
+    while thread.is_alive() or last_status < len(status_updates) or last_token < len(token_chunks):
+        while last_status < len(status_updates):
+            yield f"data: {json.dumps({'type': 'status', 'text': status_updates[last_status]})}\n\n"
+            last_status += 1
+        while last_token < len(token_chunks):
+            yield f"data: {json.dumps({'type': 'token', 'text': token_chunks[last_token]})}\n\n"
+            last_token += 1
+        time.sleep(0.05)
 
     if error_holder:
         from src.response_interpreter import explain_to_user
@@ -320,6 +353,43 @@ async def chat_stream(req: ChatRequest):
 
     return StreamingResponse(
         _stream_chat_generator(req.message, channel_user_id, history),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/events/stream")
+async def events_stream():
+    """SSE firehose of all log_event calls across the server.
+
+    Subscribers receive every structured event in real time. Used by the
+    web console's live-stream drawer. Auth: same WEB_API_KEY as other
+    /api/* routes (header or ?key= query param — EventSource can't send headers).
+    """
+    loop, q = subscribe_events()
+
+    async def gen():
+        try:
+            # Initial hello so the client knows the connection is alive
+            yield f"data: {json.dumps({'event_type': 'connected', 'ts': time.time()})}\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+                except asyncio.TimeoutError:
+                    # Keepalive comment — prevents proxies from closing idle conns
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            raise
+        finally:
+            unsubscribe_events(loop, q)
+
+    return StreamingResponse(
+        gen(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
