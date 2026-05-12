@@ -11,7 +11,7 @@ type Line =
   | { kind: 'error'; text: string }
   | { kind: 'system'; text: string }
 
-const PROMPT = '>'
+const PROMPT = 'Me:'
 
 function fmtElapsed(ms: number): string {
   const s = Math.floor(ms / 1000)
@@ -206,7 +206,6 @@ export default function ChatPane() {
     >
       <div className="flex shrink-0 items-center justify-between border-b border-[var(--color-border)] px-4 py-2 text-xs uppercase tracking-wider text-[var(--color-fg-dim)]">
         <div className="flex items-center gap-3">
-          <span>chat</span>
           <span className="normal-case text-[10px] text-[var(--color-fg-dim)]">
             {chatId.slice(0, 12)}…
           </span>
@@ -220,9 +219,6 @@ export default function ChatPane() {
           >
             + new
           </button>
-          <span className={busy ? 'text-[var(--color-warn)]' : 'text-[var(--color-good)]'}>
-            {busy ? '● running' : '○ idle'}
-          </span>
         </div>
       </div>
 
@@ -293,7 +289,7 @@ export default function ChatPane() {
         {/* Active prompt — the input lives inside the transcript flow */}
         {!busy && (
           <div className="flex items-baseline py-0.5">
-            <span className="select-none text-[var(--color-accent)]">{PROMPT}&nbsp;</span>
+            <span className="select-none font-semibold text-[var(--color-accent)]">{PROMPT}&nbsp;</span>
             <input
               ref={inputRef}
               value={input}
