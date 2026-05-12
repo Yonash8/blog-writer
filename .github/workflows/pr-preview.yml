@@ -78,11 +78,15 @@ jobs:
               body = f.read()
           url = os.environ['PREVIEW_URL']
           block = f"<!-- pr-preview-start -->\nPreview: {url}\n<!-- pr-preview-end -->"
-          pattern = r"<!-- pr-preview-start -->.*?<!-- pr-preview-end -->"
-          if re.search(pattern, body, flags=re.DOTALL):
-              new_body = re.sub(pattern, block, body, count=1, flags=re.DOTALL)
-          else:
-              new_body = block + "\n\n" + body
+          # Only strip a leading block (anchored at start). Markers appearing in
+          # the middle of the body (e.g. documentation) are left alone.
+          stripped = re.sub(
+              r"\A<!-- pr-preview-start -->.*?<!-- pr-preview-end -->\n*",
+              "",
+              body,
+              flags=re.DOTALL,
+          )
+          new_body = block + "\n\n" + stripped
           sys.stdout.write(new_body)
           PY
           gh pr edit "$PR_NUMBER" --body-file /tmp/pr_body_new.txt
@@ -112,8 +116,14 @@ jobs:
           import re, sys
           with open('/tmp/pr_body.txt') as f:
               body = f.read()
-          pattern = r"<!-- pr-preview-start -->.*?<!-- pr-preview-end -->\n*"
-          new_body = re.sub(pattern, "", body, flags=re.DOTALL)
+          # Only strip a leading block (anchored at start) so docs that
+          # mention the markers in body text are preserved.
+          new_body = re.sub(
+              r"\A<!-- pr-preview-start -->.*?<!-- pr-preview-end -->\n*",
+              "",
+              body,
+              flags=re.DOTALL,
+          )
           sys.stdout.write(new_body)
           PY
           gh pr edit "$PR_NUMBER" --body-file /tmp/pr_body_new.txt
