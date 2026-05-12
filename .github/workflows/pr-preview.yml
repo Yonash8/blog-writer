@@ -65,6 +65,32 @@ jobs:
             App: `${{ env.APP_NAME }}`
             Commit: `${{ github.event.pull_request.head.sha }}`
 
+      - name: Update PR description with preview URL
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PREVIEW_URL: https://${{ env.APP_NAME }}.fly.dev
+        run: |
+          gh pr view "$PR_NUMBER" --json body -q .body > /tmp/pr_body.txt
+          python3 <<'PY' > /tmp/pr_body_new.txt
+          import os, re, sys
+          with open('/tmp/pr_body.txt') as f:
+              body = f.read()
+          url = os.environ['PREVIEW_URL']
+          block = f"<!-- pr-preview-start -->\nPreview: {url}\n<!-- pr-preview-end -->"
+          # Only strip a leading block (anchored at start). Markers appearing in
+          # the middle of the body (e.g. documentation) are left alone.
+          stripped = re.sub(
+              r"\A<!-- pr-preview-start -->.*?<!-- pr-preview-end -->\n*",
+              "",
+              body,
+              flags=re.DOTALL,
+          )
+          new_body = block + "\n\n" + stripped
+          sys.stdout.write(new_body)
+          PY
+          gh pr edit "$PR_NUMBER" --body-file /tmp/pr_body_new.txt
+
   destroy:
     name: destroy
     if: github.event.action == 'closed'
@@ -79,3 +105,25 @@ jobs:
           header: pr-preview
           message: |
             Preview app `${{ env.APP_NAME }}` destroyed.
+
+      - name: Strip preview URL from PR description
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr view "$PR_NUMBER" --json body -q .body > /tmp/pr_body.txt
+          python3 <<'PY' > /tmp/pr_body_new.txt
+          import re, sys
+          with open('/tmp/pr_body.txt') as f:
+              body = f.read()
+          # Only strip a leading block (anchored at start) so docs that
+          # mention the markers in body text are preserved.
+          new_body = re.sub(
+              r"\A<!-- pr-preview-start -->.*?<!-- pr-preview-end -->\n*",
+              "",
+              body,
+              flags=re.DOTALL,
+          )
+          sys.stdout.write(new_body)
+          PY
+          gh pr edit "$PR_NUMBER" --body-file /tmp/pr_body_new.txt
