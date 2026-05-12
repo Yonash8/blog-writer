@@ -135,7 +135,14 @@ async def api_key_middleware(request: Request, call_next):
     """
     path = request.url.path
     open_paths = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
-    if path in open_paths or path.startswith("/webhooks/"):
+    # Static SPA assets are public — the SPA enforces its own login flow
+    # against /api/auth/login. Gating /console/* here would 401 the bundle
+    # and leave the user staring at a JSON error instead of the login screen.
+    if (
+        path in open_paths
+        or path.startswith("/webhooks/")
+        or path.startswith("/console")
+    ):
         return await call_next(request)
     # Auth endpoints are themselves open (the body carries the credential).
     if path in ("/api/auth/login", "/api/auth/me"):
