@@ -228,9 +228,11 @@ async def health():
 
 @app.get("/")
 async def root():
-    """Root endpoint - redirect to API docs."""
+    """Root endpoint — redirect to the console SPA if it's been built,
+    otherwise fall back to the API docs."""
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/docs")
+    target = "/console/" if _WEB_DIST.exists() else "/docs"
+    return RedirectResponse(url=target)
 
 
 # Mount the React console SPA at /console if the bundle exists.
