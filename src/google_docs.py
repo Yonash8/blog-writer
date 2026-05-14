@@ -1,11 +1,15 @@
 """Create Google Docs from article markdown. Uses OAuth (user) or service account credentials."""
 
+import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load .env from project root (parent of src/)
 _load_env = Path(__file__).resolve().parent.parent / ".env"
@@ -38,7 +42,13 @@ def _get_oauth_creds():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            # Build client config from env
+            # Browser flow only makes sense in an interactive terminal. On a server
+            # (no TTY) it would bind a local port and wait forever, so raise instead
+            # and let the caller fall back to service account credentials.
+            if not sys.stdin.isatty():
+                raise RuntimeError(
+                    "OAuth token missing or unrefreshable in non-interactive context"
+                )
             client_id = os.getenv("GOOGLE_CLIENT_ID")
             client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
             if not client_id or not client_secret:
@@ -68,21 +78,41 @@ def _get_oauth_creds():
 
 
 def _get_service_account_creds():
-    """Get service account credentials."""
+    """Get service account credentials from JSON content (env var) or file path.
+
+    Prefers GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON string) so the credential can
+    live as a Fly secret without needing to bake a file into the image. Falls
+    back to GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_CREDENTIALS_PATH file paths.
+    """
+    import json
     from google.oauth2 import service_account
+
+    creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if creds_json:
+        info = json.loads(creds_json)
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS_PATH")
     if creds_path and not os.path.isabs(creds_path):
         creds_path = str(Path(__file__).resolve().parent.parent / creds_path)
     if not creds_path or not Path(creds_path).exists():
-        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS must point to a service account JSON file.")
+        raise ValueError(
+            "No Google service account credentials available. Set GOOGLE_SERVICE_ACCOUNT_JSON "
+            "(raw JSON) or GOOGLE_APPLICATION_CREDENTIALS (file path)."
+        )
     return service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
 
 
 def _get_creds():
-    """Get credentials: OAuth (user) if configured, else service account."""
-    if _use_oauth():
-        return _get_oauth_creds()
+    """Get credentials: OAuth if a refreshable token file is present, else service account.
+    Falls back to service account if OAuth refresh fails (e.g. revoked token in prod)."""
+    if _use_oauth() and _TOKEN_PATH.exists():
+        try:
+            return _get_oauth_creds()
+        except Exception as e:
+            logger.warning(
+                "OAuth credentials unavailable (%s); falling back to service account.", e
+            )
     return _get_service_account_creds()
 
 
@@ -328,7 +358,7 @@ def create_doc_from_markdown(
                 },
             })
             idx += 1
-            insert_requests.append({"insertText": {"location": {"index": idx}, "text": nl}})
+            insert_requests.append({"insertText": {"location": {"index": idx}, "text": "\n"}})
             idx += 1
         is_first_block = False
 

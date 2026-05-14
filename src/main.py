@@ -18,9 +18,10 @@ import logging
 from typing import Optional
 
 from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from src.observability import log_event, persist_trace
+from src.observability import log_event, persist_trace, subscribe_events, unsubscribe_events
 
 templates = Jinja2Templates(directory=Path(__file__).resolve().parent / "templates")
 
@@ -45,11 +46,15 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Ensure DB schema is up to date (adds missing columns if needed)
-    from src.db import ensure_articles_schema
+    from src.db import ensure_articles_schema, ensure_sessions_schema
     try:
         ensure_articles_schema()
     except Exception as e:
         logger.warning("Schema migration on startup failed (non-fatal): %s", e)
+    try:
+        ensure_sessions_schema()
+    except Exception as e:
+        logger.warning("Sessions schema migration on startup failed (non-fatal): %s", e)
 
     # Eager-load all prompts, then apply tool description overrides from PromptLayer
     from src.prompts_loader import load_all_prompts
@@ -74,26 +79,142 @@ app.add_middleware(
 )
 
 
+import base64
+import hashlib
+import hmac
+import secrets
+
+
+_AUTH_TOKEN_TTL_SEC = 30 * 24 * 3600  # 30 days
+_PROD_HOST_HINT = ("fly.dev", "fly.io")
+
+
+def _is_localhost(host: str) -> bool:
+    h = (host or "").split(":")[0].lower()
+    return h in {"localhost", "127.0.0.1", "::1", ""}
+
+
+def _mint_auth_token(password: str) -> str:
+    """Return a base64-url token: expiry|nonce|hmac(expiry|nonce, password)."""
+    expiry = int(time.time()) + _AUTH_TOKEN_TTL_SEC
+    nonce = secrets.token_urlsafe(12)
+    msg = f"{expiry}|{nonce}".encode()
+    mac = hmac.new(password.encode(), msg, hashlib.sha256).hexdigest()
+    raw = f"{expiry}|{nonce}|{mac}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _verify_auth_token(token: str, password: str) -> bool:
+    """True iff token is a valid HMAC over expiry|nonce signed with password,
+    and the expiry hasn't passed.
+    """
+    if not token or not password:
+        return False
+    try:
+        padding = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode(token + padding).decode()
+        expiry_str, nonce, mac = raw.rsplit("|", 2)
+        expiry = int(expiry_str)
+    except Exception:
+        return False
+    if expiry < int(time.time()):
+        return False
+    msg = f"{expiry}|{nonce}".encode()
+    expected = hmac.new(password.encode(), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, mac)
+
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    """Require X-API-Key or Bearer token on all /api/* and /admin/* routes."""
+    """Gate all /api/* and /admin/* with the console password (raw header value
+    OR a signed token issued by POST /api/auth/login).
+
+    Localhost remains open if no password is configured (dev convenience).
+    Anything else (prod, PR previews) MUST set CONSOLE_PASSWORD/WEB_API_KEY or
+    everything 401s — no silent allow-all.
+    """
     path = request.url.path
     open_paths = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
-    if path in open_paths or path.startswith("/webhooks/"):
+    # Static SPA assets are public — the SPA enforces its own login flow
+    # against /api/auth/login. Gating /console/* here would 401 the bundle
+    # and leave the user staring at a JSON error instead of the login screen.
+    if (
+        path in open_paths
+        or path.startswith("/webhooks/")
+        or path.startswith("/console")
+    ):
+        return await call_next(request)
+    # Auth endpoints are themselves open (the body carries the credential).
+    if path in ("/api/auth/login", "/api/auth/me"):
         return await call_next(request)
 
-    web_api_key = os.getenv("WEB_API_KEY")
-    if not web_api_key:
-        # No key configured — allow all (local dev)
-        return await call_next(request)
+    password = os.getenv("CONSOLE_PASSWORD") or os.getenv("WEB_API_KEY")
+    host = request.headers.get("host", "")
+    if not password:
+        if _is_localhost(host) and not any(p in host for p in _PROD_HOST_HINT):
+            # Local dev without a password configured — open.
+            return await call_next(request)
+        return JSONResponse(
+            {"detail": "Server password is not configured. Set CONSOLE_PASSWORD."},
+            status_code=503,
+        )
 
     auth = request.headers.get("Authorization", "")
     x_key = request.headers.get("X-API-Key", "")
-    provided = auth[7:] if auth.startswith("Bearer ") else x_key
+    # EventSource cannot send custom headers — allow `?key=...` as a fallback.
+    query_key = request.query_params.get("key", "")
+    if auth.startswith("Bearer "):
+        provided = auth[7:]
+    elif x_key:
+        provided = x_key
+    else:
+        provided = query_key
 
-    if provided != web_api_key:
+    if not provided:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-    return await call_next(request)
+    # Accept either the raw password (legacy / curl convenience) OR a valid
+    # signed token previously issued by POST /api/auth/login.
+    if hmac.compare_digest(provided, password) or _verify_auth_token(provided, password):
+        return await call_next(request)
+    return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.post("/api/auth/login")
+async def auth_login(req: LoginRequest):
+    """Exchange the console password for a signed bearer token (TTL 30d).
+
+    The token is HMAC(expiry|nonce, CONSOLE_PASSWORD) — stateless, so we don't
+    need a sessions table. Verified by the api_key_middleware on every request.
+    """
+    password = os.getenv("CONSOLE_PASSWORD") or os.getenv("WEB_API_KEY")
+    if not password:
+        raise HTTPException(status_code=503, detail="Server password is not configured.")
+    if not hmac.compare_digest(req.password, password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    token = _mint_auth_token(password)
+    return {"token": token, "ttl_seconds": _AUTH_TOKEN_TTL_SEC}
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    """Returns whether the current credential is valid. Used by the SPA on
+    boot to decide if a token in localStorage is still good.
+    """
+    password = os.getenv("CONSOLE_PASSWORD") or os.getenv("WEB_API_KEY")
+    if not password:
+        return {"authenticated": False, "reason": "no_password_configured"}
+    auth = request.headers.get("Authorization", "")
+    x_key = request.headers.get("X-API-Key", "")
+    query_key = request.query_params.get("key", "")
+    provided = auth[7:] if auth.startswith("Bearer ") else (x_key or query_key)
+    ok = bool(provided) and (
+        hmac.compare_digest(provided, password) or _verify_auth_token(provided, password)
+    )
+    return {"authenticated": ok}
 
 
 class ChatRequest(BaseModel):
@@ -114,9 +235,22 @@ async def health():
 
 @app.get("/")
 async def root():
-    """Root endpoint - redirect to API docs."""
+    """Root endpoint — redirect to the console SPA if it's been built,
+    otherwise fall back to the API docs."""
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/docs")
+    target = "/console/" if _WEB_DIST.exists() else "/docs"
+    return RedirectResponse(url=target)
+
+
+# Mount the React console SPA at /console if the bundle exists.
+# Dev: `cd web && npm run dev` (Vite on :5173 proxies to this server on :8000).
+# Prod: the Dockerfile builds web/dist via a Node stage and copies it in.
+_WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+if _WEB_DIST.exists():
+    app.mount("/console", StaticFiles(directory=str(_WEB_DIST), html=True), name="console")
+    logger.info("[CONSOLE] mounted /console -> %s", _WEB_DIST)
+else:
+    logger.info("[CONSOLE] %s not found - run `cd web && npm run build` to enable /console", _WEB_DIST)
 
 
 @app.get("/api/chat/status")
@@ -211,115 +345,384 @@ async def chat(req: ChatRequest):
     )
 
 
-def _stream_chat_generator(message: str, channel_user_id: str, history: list):
-    """Sync generator for SSE stream: status updates then final result."""
-    from src.agent import run_agent
-    from src.db import add_message_for_user
-    from src.task_state import set_task, clear_task
+def _sse(event: dict) -> str:
+    """Serialize an event for SSE wire format."""
+    return f"data: {json.dumps(event, default=str)}\n\n"
 
-    user_key = channel_user_id or "default"
+
+def _generate_session_title_async(session_id: str, user_message: str) -> None:
+    """Best-effort Haiku call to produce a short session title from the first
+    user message. Runs in a daemon thread; any failure is logged and swallowed.
+    Prioritizes the article topic / main intent ('Find me X about Y', etc.).
+    """
+    def _run() -> None:
+        try:
+            from anthropic import Anthropic
+            client = Anthropic()
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=40,
+                system=(
+                    "Return a 3-7 word title (no quotes, no period) that captures the "
+                    "user's request in this message. If they're asking for an article, "
+                    "use the article topic. If it's a research request, use 'Find X about Y' "
+                    "style. Otherwise summarize the main intent in plain English. "
+                    "Output the title only, nothing else."
+                ),
+                messages=[{"role": "user", "content": user_message[:1000]}],
+            )
+            text_blocks = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+            title = " ".join(text_blocks).strip().strip('"\'`').rstrip(".")
+            if not title:
+                return
+            from src.db import rename_session
+            rename_session(session_id, title[:120])
+            logger.info("[SESSION] Auto-titled %s -> %r", session_id[:8], title[:60])
+        except Exception as e:
+            logger.warning("[SESSION] Title generation failed for %s: %s", session_id[:8], e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _run_agent_into_buffer(buf, session_id: str, channel: str, channel_user_id: str,
+                            message: str, history: list) -> None:
+    """Run the agent in the current thread, writing all events into ``buf``
+    and persisting the user message + final assistant message (or stub on
+    error/cancel) to Supabase tied to the session.
+    """
+    from src.agent import run_agent
+    from src.db import add_message_for_session, get_session, rename_session
+    from src.task_state import set_task_by_key, clear_task_by_key, is_cancel_requested_by_key
+    from src.response_interpreter import explain_to_user
+
+    task_key = f"session:{session_id}"
+    set_task_by_key(task_key, "Processing your request...")
+    req_start = time.perf_counter()
+
+    def on_status(text: str) -> None:
+        set_task_by_key(task_key, text)
+        buf.append("status", text=text)
+
+    def on_token(delta: str) -> None:
+        buf.append("token", text=delta)
+
+    try:
+        result = run_agent(
+            user_message=message,
+            history=history,
+            channel=channel,
+            channel_user_id=channel_user_id,
+            on_status=on_status,
+            on_token=on_token,
+            trace_id=buf.run_id,
+            session_id=session_id,
+        )
+
+        article = result.get("article")
+        message_out = result.get("message", "")
+        if article and article.get("google_doc_url"):
+            message_out = f"Here's your article: {article['google_doc_url']}"
+        elif article and article.get("content"):
+            message_out = article["content"]
+
+        # Persist user + assistant turn into the session transcript.
+        add_message_for_session(session_id, channel, channel_user_id, "user", message)
+        add_message_for_session(session_id, channel, channel_user_id, "assistant", message_out)
+
+        total_ms = (time.perf_counter() - req_start) * 1000
+        log_event(
+            "request_done",
+            total_latency_ms=round(total_ms, 2),
+            has_article=article is not None,
+            final_message_len=len(message_out),
+        )
+        persist_trace(message_out)
+
+        buf.finish({"message": message_out, "article": article})
+
+        # Auto-title sessions that don't have one yet.
+        try:
+            sess = get_session(session_id)
+            if sess and not (sess.get("title") or "").strip():
+                _generate_session_title_async(session_id, message)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.exception("[STREAM] Agent error for session %s: %s", session_id[:8], e)
+        # Persist user message + a stub assistant reply so the transcript
+        # reflects what was attempted when the user comes back.
+        cancelled = is_cancel_requested_by_key(task_key)
+        stub = "[cancelled]" if cancelled else f"[error: {explain_to_user(str(e))}]"
+        try:
+            add_message_for_session(session_id, channel, channel_user_id, "user", message)
+            add_message_for_session(session_id, channel, channel_user_id, "assistant", stub)
+        except Exception as persist_err:
+            logger.warning("[STREAM] Failed to persist stub message: %s", persist_err)
+        buf.fail(stub)
+    finally:
+        clear_task_by_key(task_key)
+
+
+def _session_chat_generator(session_id: str, channel: str, channel_user_id: str,
+                             message: str, history: list):
+    """SSE generator: start a new run for the session and stream events.
+
+    Yields a 409-shaped event if there's already an active run for this session.
+    """
+    from src.run_buffer import start_run, replay_and_tail
+
     trace_id = str(uuid.uuid4())
     log_event(
         "request_start",
-        channel="web",
-        channel_user_id=user_key,
+        channel=channel,
+        channel_user_id=channel_user_id,
+        session_id=session_id,
         message_preview=message[:100] + ("..." if len(message) > 100 else ""),
     )
-    set_task("web", user_key, "Processing your request...")
 
-    logger.info("[STREAM] Starting stream: message=%r, channel_user_id=%s, history_len=%d", message[:80], channel_user_id, len(history))
-    status_updates = []
-    result_holder = []
-
-    def on_status(text: str) -> None:
-        set_task("web", user_key, text)
-        status_updates.append(text)
-
-    error_holder: list[Exception] = []
-
-    def run() -> None:
-        req_start = time.perf_counter()
-        try:
-            res = run_agent(
-                user_message=message,
-                history=history,
-                channel="web",
-                channel_user_id=user_key,
-                on_status=on_status,
-                trace_id=trace_id,
-            )
-            result_holder.append(res)
-            article = res.get("article")
-            msg = res.get("message", "")
-            if article and article.get("google_doc_url"):
-                msg = f"Here's your article: {article['google_doc_url']}"
-            elif article and article.get("content"):
-                msg = article["content"]
-            total_ms = (time.perf_counter() - req_start) * 1000
-            log_event(
-                "request_done",
-                total_latency_ms=round(total_ms, 2),
-                has_article=article is not None,
-                final_message_len=len(msg),
-            )
-            persist_trace(msg)
-        except Exception as e:
-            error_holder.append(e)
-
-    thread = threading.Thread(target=run)
-    thread.start()
-    last_len = 0
-
-    while thread.is_alive() or last_len < len(status_updates):
-        while last_len < len(status_updates):
-            yield f"data: {json.dumps({'type': 'status', 'text': status_updates[last_len]})}\n\n"
-            last_len += 1
-        time.sleep(0.2)
-
-    if error_holder:
-        from src.response_interpreter import explain_to_user
-        friendly = explain_to_user(str(error_holder[0]))
-        clear_task("web", user_key)
-        done_payload = {"type": "done", "message": friendly, "article": None, "error": True}
-        yield f"data: {json.dumps(done_payload)}\n\n"
+    buf = start_run(session_id, trace_id)
+    if buf is None:
+        yield _sse({
+            "type": "error",
+            "code": "session_busy",
+            "message": "This session already has a run in progress.",
+        })
         return
 
-    result = result_holder[0] if result_holder else {}
-    clear_task("web", user_key)
+    logger.info("[STREAM] Starting run for session %s, history_len=%d", session_id[:8], len(history))
 
-    article = result.get("article")
-    message_out = result.get("message", "")
-    if article and article.get("google_doc_url"):
-        message_out = f"Here's your article: {article['google_doc_url']}"
-    elif article and article.get("content"):
-        message_out = article["content"]
+    thread = threading.Thread(
+        target=_run_agent_into_buffer,
+        args=(buf, session_id, channel, channel_user_id, message, history),
+        daemon=True,
+    )
+    thread.start()
 
-    add_message_for_user("web", user_key, "user", message)
-    add_message_for_user("web", user_key, "assistant", message_out)
+    for event in replay_and_tail(buf, from_seq=0):
+        yield _sse(event)
 
-    done_payload = {
-        "type": "done",
-        "message": message_out,
-        "article": article,
+
+def _attach_session_stream(session_id: str, from_seq: int):
+    """SSE generator that attaches to an existing run's buffer (if any)."""
+    from src.run_buffer import get_run, replay_and_tail
+
+    buf = get_run(session_id)
+    if buf is None:
+        # No active run — emit a snapshot saying so and close.
+        yield _sse({
+            "seq": from_seq,
+            "type": "snapshot",
+            "session_id": session_id,
+            "running": False,
+            "last_seq": from_seq,
+            "last_tool": None,
+            "last_status": None,
+        })
+        return
+
+    for event in replay_and_tail(buf, from_seq=from_seq):
+        yield _sse(event)
+
+
+# --- Session CRUD + run endpoints --------------------------------------------
+
+class SessionCreateRequest(BaseModel):
+    channel_user_id: Optional[str] = None
+    title: Optional[str] = None
+
+
+class SessionRenameRequest(BaseModel):
+    title: str
+
+
+class SessionChatRequest(BaseModel):
+    message: str
+
+
+_DEFAULT_CHANNEL = "web"
+_DEFAULT_CHANNEL_USER_ID = "web-console"
+
+
+def _running_meta(session_id: str) -> dict:
+    """Look up the run buffer for a session and return a small status dict
+    suitable for inlining into a sessions list response.
+    """
+    from src.run_buffer import get_run
+    buf = get_run(session_id)
+    if not buf:
+        return {"running": False, "last_tool": None, "last_status": None, "run_id": None}
+    snap = buf.snapshot()
+    return {
+        "running": snap["running"],
+        "last_tool": snap["last_tool"],
+        "last_status": snap["last_status"],
+        "run_id": snap["run_id"],
     }
-    logger.info("[STREAM] Completed: has_article=%s, message_len=%d", article is not None, len(message_out))
-    yield f"data: {json.dumps(done_payload)}\n\n"
 
 
-@app.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest):
+@app.get("/api/sessions")
+async def list_sessions_endpoint(channel_user_id: Optional[str] = None):
+    """List sessions for the given web user. Each entry includes the live
+    running state (derived from the in-memory run buffer) so the sidebar can
+    show running/idle dots and the current tool/status per session.
     """
-    Streaming chat endpoint - sends SSE events with status updates during article writing,
-    then the final result. Use this to get progress updates (deep research, PromptLayer).
-    """
-    from src.db import get_messages_for_user
+    from src.db import list_sessions
+    user = channel_user_id or _DEFAULT_CHANNEL_USER_ID
+    sessions = list_sessions(_DEFAULT_CHANNEL, user)
+    for s in sessions:
+        s.update(_running_meta(s["id"]))
+    return {"sessions": sessions}
 
-    channel_user_id = req.channel_user_id or "default"
-    msgs = get_messages_for_user("web", channel_user_id)
+
+@app.post("/api/sessions")
+async def create_session_endpoint(req: Optional[SessionCreateRequest] = Body(None)):
+    from src.db import create_session
+    user = (req.channel_user_id if req else None) or _DEFAULT_CHANNEL_USER_ID
+    title = req.title if req else None
+    session = create_session(_DEFAULT_CHANNEL, user, title=title)
+    session.update({"running": False, "last_tool": None, "last_status": None, "run_id": None})
+    return session
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session_endpoint(session_id: str):
+    """Single-session fetch. Useful for the ChatPane header which needs the
+    title (especially after the async Haiku rename finishes)."""
+    from src.db import get_session
+    sess = get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    sess.update(_running_meta(session_id))
+    return sess
+
+
+@app.patch("/api/sessions/{session_id}")
+async def rename_session_endpoint(session_id: str, req: SessionRenameRequest):
+    from src.db import rename_session, get_session
+    if not get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return rename_session(session_id, req.title)
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    """Cancel the in-flight run (if any), then soft-delete the session."""
+    from src.db import soft_delete_session, get_session
+    from src.run_buffer import get_run, discard_run
+    from src.task_state import request_cancel_by_key
+
+    if not get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    buf = get_run(session_id)
+    if buf and not buf.finished:
+        request_cancel_by_key(f"session:{session_id}")
+        buf.request_cancel()
+        # Don't wait for the agent to honor it — soft-delete makes the row
+        # invisible immediately. Buffer is discarded so reconnects 404.
+    discard_run(session_id)
+    soft_delete_session(session_id)
+    return {"ok": True}
+
+
+@app.get("/api/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    from src.db import get_session, get_messages_for_session
+    if not get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    messages = get_messages_for_session(session_id)
+    return {"messages": messages}
+
+
+@app.post("/api/sessions/{session_id}/chat")
+async def session_chat_endpoint(session_id: str, req: SessionChatRequest):
+    """Kick off a new run on this session. SSE stream from seq 0."""
+    from src.db import get_session, get_messages_for_session
+
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    msgs = get_messages_for_session(session_id)
     history = [{"role": m["role"], "content": m["content"]} for m in msgs]
+    channel = session.get("channel") or _DEFAULT_CHANNEL
+    channel_user_id = session.get("channel_user_id") or _DEFAULT_CHANNEL_USER_ID
 
     return StreamingResponse(
-        _stream_chat_generator(req.message, channel_user_id, history),
+        _session_chat_generator(session_id, channel, channel_user_id, req.message, history),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/sessions/{session_id}/stream")
+async def session_stream_attach(session_id: str, from_seq: int = 0):
+    """Attach to an in-flight run. Replays from ``from_seq`` then live-tails.
+    First event yielded is always a `snapshot` so the client can render
+    immediately.
+    """
+    from src.db import get_session
+    if not get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return StreamingResponse(
+        _attach_session_stream(session_id, from_seq),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/sessions/{session_id}/cancel")
+async def session_cancel_endpoint(session_id: str):
+    from src.db import get_session
+    from src.run_buffer import get_run
+    from src.task_state import request_cancel_by_key
+
+    if not get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    cancelled = request_cancel_by_key(f"session:{session_id}")
+    buf = get_run(session_id)
+    if buf:
+        buf.request_cancel()
+    return {"cancelled": cancelled}
+
+
+@app.get("/api/events/stream")
+async def events_stream():
+    """SSE firehose of all log_event calls across the server.
+
+    Subscribers receive every structured event in real time. Used by the
+    web console's live-stream drawer. Auth: same WEB_API_KEY as other
+    /api/* routes (header or ?key= query param — EventSource can't send headers).
+    """
+    loop, q = subscribe_events()
+
+    async def gen():
+        try:
+            # Initial hello so the client knows the connection is alive
+            yield f"data: {json.dumps({'event_type': 'connected', 'ts': time.time()})}\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+                except asyncio.TimeoutError:
+                    # Keepalive comment — prevents proxies from closing idle conns
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            raise
+        finally:
+            unsubscribe_events(loop, q)
+
+    return StreamingResponse(
+        gen(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

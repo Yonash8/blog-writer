@@ -666,6 +666,174 @@ def list_optimization_sessions(limit: int = 20) -> list[dict]:
     return [_to_dict(s) for s in (r.data or [])]
 
 
+# --- Chat sessions ---
+
+_SESSIONS_DDL: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      channel text NOT NULL,
+      channel_user_id text NOT NULL,
+      title text,
+      deleted_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+    """,
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS session_id uuid REFERENCES chat_sessions(id) ON DELETE CASCADE",
+    "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_user ON chat_sessions(channel, channel_user_id, deleted_at)",
+]
+
+
+def ensure_sessions_schema() -> None:
+    """Create chat_sessions table + messages.session_id column if missing."""
+    client = get_client()
+    for ddl in _SESSIONS_DDL:
+        stmt = ddl.strip()
+        try:
+            client.rpc("execute_ddl", {"ddl": stmt}).execute()
+            _db_logger.info("[DB] Sessions DDL OK: %s", stmt[:70].replace("\n", " "))
+        except Exception as e:
+            _db_logger.warning(
+                "[DB] Sessions DDL failed (run manually in Supabase SQL editor):\n  %s\n  Error: %s",
+                stmt, e,
+            )
+
+
+def create_session(channel: str, channel_user_id: str, title: Optional[str] = None) -> dict:
+    client = get_client()
+    data: dict[str, Any] = {"channel": channel, "channel_user_id": channel_user_id}
+    if title:
+        data["title"] = title
+    r = client.table("chat_sessions").insert(data).execute()
+    if not r.data:
+        raise RuntimeError("Failed to create chat_session")
+    return _to_dict(r.data[0])
+
+
+def list_sessions(channel: str, channel_user_id: str) -> list[dict]:
+    """List non-deleted sessions, newest-updated first.
+
+    Lazy backfill: if zero sessions but legacy messages exist for this (channel, user),
+    create a Default session and adopt orphan messages into it.
+    """
+    client = get_client()
+    r = (
+        client.table("chat_sessions")
+        .select("*")
+        .eq("channel", channel)
+        .eq("channel_user_id", channel_user_id)
+        .is_("deleted_at", "null")
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    rows = r.data or []
+    if not rows:
+        legacy = (
+            client.table("messages")
+            .select("id")
+            .eq("channel", channel)
+            .eq("channel_user_id", channel_user_id)
+            .is_("session_id", "null")
+            .limit(1)
+            .execute()
+        )
+        if legacy.data:
+            # Leave title NULL so the next user message triggers Haiku naming.
+            default = create_session(channel, channel_user_id, title=None)
+            try:
+                client.table("messages").update(
+                    {"session_id": default["id"]}
+                ).eq("channel", channel).eq("channel_user_id", channel_user_id).is_(
+                    "session_id", "null"
+                ).execute()
+            except Exception as e:
+                _db_logger.warning("[DB] Failed to adopt legacy messages into Default session: %s", e)
+            rows = [default]
+    return [_to_dict(s) for s in rows]
+
+
+def get_session(session_id: str) -> Optional[dict]:
+    """Return the session, or None if missing or soft-deleted."""
+    if not session_id or not _is_full_uuid(session_id.strip()):
+        return None
+    client = get_client()
+    r = client.table("chat_sessions").select("*").eq("id", session_id.strip()).limit(1).execute()
+    if not r.data:
+        return None
+    s = _to_dict(r.data[0])
+    if s.get("deleted_at"):
+        return None
+    return s
+
+
+def rename_session(session_id: str, title: str) -> dict:
+    client = get_client()
+    r = (
+        client.table("chat_sessions")
+        .update({"title": title, "updated_at": datetime.now(timezone.utc).isoformat()})
+        .eq("id", session_id)
+        .execute()
+    )
+    if not r.data:
+        raise RuntimeError("Failed to rename session")
+    return _to_dict(r.data[0])
+
+
+def soft_delete_session(session_id: str) -> None:
+    client = get_client()
+    client.table("chat_sessions").update(
+        {"deleted_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", session_id).execute()
+
+
+def get_messages_for_session(session_id: str, limit: int = 200) -> list[dict]:
+    client = get_client()
+    r = (
+        client.table("messages")
+        .select("*")
+        .eq("session_id", session_id)
+        .order("created_at")
+        .limit(limit)
+        .execute()
+    )
+    return [_to_dict(m) for m in (r.data or [])]
+
+
+def add_message_for_session(
+    session_id: str,
+    channel: str,
+    channel_user_id: str,
+    role: str,
+    content: str,
+) -> dict:
+    """Insert a message tied to a session. Mirrors add_message but with session_id."""
+    client = get_client()
+    r = client.table("messages").insert({
+        "session_id": session_id,
+        "channel": channel,
+        "channel_user_id": channel_user_id,
+        "role": role,
+        "content": content,
+    }).execute()
+    if not r.data:
+        raise RuntimeError("Failed to add message")
+    row = _to_dict(r.data[0])
+    try:
+        client.table("chat_sessions").update(
+            {"updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", session_id).execute()
+    except Exception:
+        pass
+    try:
+        from src.message_cache import add as cache_add
+        cache_add(str(row["id"]), channel, channel_user_id, role, content, str(row["created_at"]))
+    except Exception:
+        pass
+    return row
+
+
 # --- Schema auto-migration ---
 
 _ARTICLES_COLUMNS: list[tuple[str, str]] = [

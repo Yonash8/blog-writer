@@ -27,3 +27,8 @@ data/messages.db
 data/messages.db-shm
 data/messages.db-wal
 data/messages.db*.corrupt.*
+
+# Web console (Node-built React app)
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
